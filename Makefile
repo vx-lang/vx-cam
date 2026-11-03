@@ -33,13 +33,14 @@ build/test_clip.mov: build/make_test_clip
 run: all
 	./build/vx-cam build/test_clip.mov
 
-# Runs the whole clip without a window, once with the blur on the CPU and once on
-# the GPU. Prints the stage tables, compares the two blurs bit for bit, and writes
+# Runs the whole clip without a window, once with every stage on the CPU and once
+# with the GPU stages (preprocess, blur, composite) on the GPU. Prints the stage
+# tables, compares each GPU stage with its CPU copy bit for bit, and writes
 # snapshots (frame and mask view) to build/snapshots.
 check: all
 	mkdir -p build/snapshots
 	./build/vx-cam build/test_clip.mov --headless 360 build/snapshots
-	VXCAM_GPU=blur ./build/vx-cam build/test_clip.mov --headless 360
+	VXCAM_GPU=all ./build/vx-cam build/test_clip.mov --headless 360
 
 build:
 	mkdir -p build

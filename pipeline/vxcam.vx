@@ -2,11 +2,14 @@
 //
 // The compute stages of vx-cam: background blur with auto-framing. Every stage
 // is a `pub fn`, so the host shell calls it through the C ABI (see vxcam.h).
-// The host owns every buffer and passes it as a pointer.
+// The host owns every buffer: the CPU stages take it as a pointer, and the GPU
+// stages as a tensor.
 //
-// Today every stage runs on the CPU. The GPU stages arrive with the portable
-// GPU backend. Until the segmentation model exists, `vxcam_segment` finds the
-// person by background subtraction against a static background.
+// preprocess, blur and composite are GPU kernels. vxc also compiles a CPU copy
+// of each, and `vx_metal_set_enabled` picks one for the calling thread. segment
+// and smooth run on the CPU. Until the segmentation model exists,
+// `vxcam_segment` finds the person by background subtraction against a static
+// background.
 //
 // Buffers:
 //   frame   BGRA8, w x h pixels, `stride` bytes per row (from the camera or video)
@@ -15,8 +18,6 @@
 //   crop    4 f32: x0, y0, width, height of the output window, in frame pixels
 //
 //===----------------------------------------------------------------------===//
-
-import core::convert;
 
 fn min_f32(a : f32, b : f32) -> f32 {
   if a < b {
@@ -66,35 +67,44 @@ fn smoothstep(lo : f32, hi : f32, v : f32) -> f32 {
 //===----------------------------------------------------------------------===//
 // Stage 1: preprocess. Average each scale x scale block of the frame into one
 // pixel of `small`, and convert BGRA8 to RGB f32.
+//
+// A GPU kernel, one lane per pixel of `small`. The frame is `[h, stride]` bytes:
+// Vx ignores the row stride of a tensor from C, so the padding at the end of
+// each row is part of the row.
 //===----------------------------------------------------------------------===//
 
-pub fn vxcam_preprocess(small : *mut f32, frame : *const u8, w : i64, h : i64, stride : i64,
-scale : i64) -> void {
-  let sw = w / scale;
-  let sh = h / scale;
-  let inv : f32 = 1.0 / ((scale * scale) as f32 * 255.0);
-  unsafe {
-    for sy in 0..sh {
-      for sx in 0..sw {
+// `inv` is 1 / (scale * scale * 255).
+fn preprocess_kernel(small : &mut Tensor<f32, [?, ?], Memory::HBM>,
+frame : &Tensor<u8, [?, ?], Memory::HBM>, sw : i32, sh : i32, scale : i32,
+inv : f32) -> void {
+  spawn on(Topology::Device) {
+    for sy in 0..sh across blocks {
+      for sx in 0..sw across lanes(256) {
         let mut r : f32 = 0.0;
         let mut g : f32 = 0.0;
         let mut b : f32 = 0.0;
         for dy in 0..scale {
-          let row = (sy * scale + dy) * stride;
+          let y = sy * scale + dy;
           for dx in 0..scale {
-            let p = row + (sx * scale + dx) * 4;
-            b = b + f32::from(frame[p]);
-            g = g + f32::from(frame[p + 1]);
-            r = r + f32::from(frame[p + 2]);
+            let p = (sx * scale + dx) * 4;
+            b = b + frame[y][p] as f32;
+            g = g + frame[y][p + 1] as f32;
+            r = r + frame[y][p + 2] as f32;
           }
         }
-        let o = (sy * sw + sx) * 3;
-        small[o] = r * inv;
-        small[o + 1] = g * inv;
-        small[o + 2] = b * inv;
+        small[sy][sx * 3] = r * inv;
+        small[sy][sx * 3 + 1] = g * inv;
+        small[sy][sx * 3 + 2] = b * inv;
       }
     }
   }
+  return;
+}
+
+pub fn vxcam_preprocess(small : &mut Tensor<f32, [?, ?], Memory::HBM>,
+frame : &Tensor<u8, [?, ?], Memory::HBM>, sw : i32, sh : i32, scale : i32) -> void {
+  let inv : f32 = 1.0 / ((scale * scale) as f32 * 255.0);
+  preprocess_kernel(small, frame, sw, sh, scale, inv);
   return;
 }
 
@@ -317,94 +327,134 @@ rows : i32, cols : i32, radius : i32) -> void {
 // Stage 5: composite. For each output pixel, find where it comes from inside the
 // crop window, then mix the sharp frame and the blurred background by the mask.
 // `mode` 0 is the normal output, 1 shows the mask, 2 turns the blur off.
+//
+// A GPU kernel, one lane per output pixel. `frame` is `[h, stride]` bytes as in
+// preprocess, `out` is `[h, w]` BGRA pixels, `blurred` is `[sh, 3 * sw]` and
+// `mask` is `[sh, sw]`.
 //===----------------------------------------------------------------------===//
 
-// Bilinear mix of four neighbours: a and b on the top row, d and e below.
-fn lerp2(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32) -> f32 {
-  let top = a + fx * (b - a);
-  let bottom = d + fx * (e - d);
-  return top + fy * (bottom - top);
-}
-
-// The buffers of one composite call. A raw pointer is not `Send`, so a task
-// cannot take one by itself. Each task writes only its own rows of `out`, so
-// no two tasks write the same byte.
-struct CompositeBuffers {
-  out : *mut u8,
-  frame : *const u8,
-  blurred : *const f32,
-  mask : *const f32,
-}
-unsafe impl Send for CompositeBuffers {}
-
-// Rows `from` to `to` of the output. The crop window is x0, y0 and the scale
-// kx, ky from output pixels to frame pixels.
-fn composite_rows(bufs : CompositeBuffers, x0 : f32, y0 : f32, kx : f32, ky : f32, w : i64,
-h : i64, stride : i64, out_stride : i64, scale : i64, mode : i64, from : i64, to : i64) -> i64 {
-  let out = bufs.out;
-  let frame = bufs.frame;
-  let blurred = bufs.blurred;
-  let mask = bufs.mask;
-  let sw = w / scale;
-  let sh = h / scale;
-  let inv_scale : f32 = 1.0 / (scale as f32);
-  unsafe {
-    for oy in from..to {
-      // Where this row comes from, in the frame and in the small images.
-      let sy = clamp_f32(y0 + ((oy as f32) + 0.5) * ky - 0.5, 0.0, (h - 1) as f32);
-      let iy0 = sy as i64;
-      let iy1 = min_i64(iy0 + 1, h - 1);
-      let fy = sy - iy0 as f32;
-      let v = clamp_f32((sy + 0.5) * inv_scale - 0.5, 0.0, (sh - 1) as f32);
-      let vy0 = v as i64;
-      let vy1 = min_i64(vy0 + 1, sh - 1);
-      let gy = v - vy0 as f32;
-      for ox in 0..w {
-        let sx = clamp_f32(x0 + ((ox as f32) + 0.5) * kx - 0.5, 0.0, (w - 1) as f32);
-        let ix0 = sx as i64;
-        let ix1 = min_i64(ix0 + 1, w - 1);
+// The crop window is x0, y0 and the scale kx, ky from output pixels to frame
+// pixels. `inv_scale` is 1 / scale, from frame pixels to small pixels.
+//
+// Each lane writes its pixel as one u32 (B, G, R, A from the low byte up), so
+// the race checker sees that no two lanes write the same element. The work is
+// written out in the loop, without helper functions: vxc's Metal generator does
+// not inline calls yet. Each clamp is max with the low end, then min with the
+// high end, as clamp_f32 does. Each bilinear mix is a + fx * (b - a) along the
+// row, then the same down the column.
+fn composite_kernel(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
+frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
+mask : &Tensor<f32, [?, ?], Memory::HBM>, x0 : f32, y0 : f32, kx : f32, ky : f32,
+inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
+  spawn on(Topology::Device) {
+    for oy in 0..h across blocks {
+      for ox in 0..w across lanes(256) {
+        // Where this pixel comes from: sy, sx in the frame, v, u in the small images.
+        let ty = y0 + ((oy as f32) + 0.5) * ky - 0.5;
+        let mut sy : f32 = 0.0;
+        if ty > 0.0 {
+          sy = ty;
+        }
+        if sy > (h - 1) as f32 {
+          sy = (h - 1) as f32;
+        }
+        let iy0 = sy as i32;
+        let mut iy1 = iy0 + 1;
+        if iy1 > h - 1 {
+          iy1 = h - 1;
+        }
+        let fy = sy - iy0 as f32;
+        let tv = (sy + 0.5) * inv_scale - 0.5;
+        let mut v : f32 = 0.0;
+        if tv > 0.0 {
+          v = tv;
+        }
+        if v > (sh - 1) as f32 {
+          v = (sh - 1) as f32;
+        }
+        let vy0 = v as i32;
+        let mut vy1 = vy0 + 1;
+        if vy1 > sh - 1 {
+          vy1 = sh - 1;
+        }
+        let gy = v - vy0 as f32;
+        let tx = x0 + ((ox as f32) + 0.5) * kx - 0.5;
+        let mut sx : f32 = 0.0;
+        if tx > 0.0 {
+          sx = tx;
+        }
+        if sx > (w - 1) as f32 {
+          sx = (w - 1) as f32;
+        }
+        let ix0 = sx as i32;
+        let mut ix1 = ix0 + 1;
+        if ix1 > w - 1 {
+          ix1 = w - 1;
+        }
         let fx = sx - ix0 as f32;
-        let u = clamp_f32((sx + 0.5) * inv_scale - 0.5, 0.0, (sw - 1) as f32);
-        let ux0 = u as i64;
-        let ux1 = min_i64(ux0 + 1, sw - 1);
+        let tu = (sx + 0.5) * inv_scale - 0.5;
+        let mut u : f32 = 0.0;
+        if tu > 0.0 {
+          u = tu;
+        }
+        if u > (sw - 1) as f32 {
+          u = (sw - 1) as f32;
+        }
+        let ux0 = u as i32;
+        let mut ux1 = ux0 + 1;
+        if ux1 > sw - 1 {
+          ux1 = sw - 1;
+        }
         let gx = u - ux0 as f32;
-        let q00 = vy0 * sw + ux0;
-        let q01 = vy0 * sw + ux1;
-        let q10 = vy1 * sw + ux0;
-        let q11 = vy1 * sw + ux1;
-        let m = lerp2(mask[q00], mask[q01], mask[q10], mask[q11], gx, gy);
-        let o = oy * out_stride + ox * 4;
-        let p00 = iy0 * stride + ix0 * 4;
-        let p01 = iy0 * stride + ix1 * 4;
-        let p10 = iy1 * stride + ix0 * 4;
-        let p11 = iy1 * stride + ix1 * 4;
-        for c in 0i64..3i64 {
-          // BGRA in the frame, RGB in `blurred`.
-          let sharp = lerp2(f32::from(frame[p00 + c]), f32::from(frame[p01 + c]),
-          f32::from(frame[p10 + c]), f32::from(frame[p11 + c]), fx, fy);
+        let mt = mask[vy0][ux0] + gx * (mask[vy0][ux1] - mask[vy0][ux0]);
+        let mb = mask[vy1][ux0] + gx * (mask[vy1][ux1] - mask[vy1][ux0]);
+        let m = mt + gy * (mb - mt);
+        let mut pixel : u32 = 4278190080; // A = 255
+        for c in 0..3 {
+          // BGRA in the frame and in `out`, RGB in `blurred`.
+          let a00 = frame[iy0][ix0 * 4 + c] as f32;
+          let a01 = frame[iy0][ix1 * 4 + c] as f32;
+          let a10 = frame[iy1][ix0 * 4 + c] as f32;
+          let a11 = frame[iy1][ix1 * 4 + c] as f32;
+          let st = a00 + fx * (a01 - a00);
+          let sb = a10 + fx * (a11 - a10);
+          let sharp = st + fy * (sb - st);
           let k = 2 - c;
+          let b00 = blurred[vy0][ux0 * 3 + k];
+          let b01 = blurred[vy0][ux1 * 3 + k];
+          let b10 = blurred[vy1][ux0 * 3 + k];
+          let b11 = blurred[vy1][ux1 * 3 + k];
+          let bt = b00 + gx * (b01 - b00);
+          let bb = b10 + gx * (b11 - b10);
+          let soft = 255.0 * (bt + gy * (bb - bt));
           let mut value = sharp;
           if mode == 0 {
-            let soft = 255.0 * lerp2(blurred[q00 * 3 + k], blurred[q01 * 3 + k],
-            blurred[q10 * 3 + k], blurred[q11 * 3 + k], gx, gy);
             value = soft + m * (sharp - soft);
           }
           if mode == 1 {
             value = 0.25 * sharp + 0.75 * 255.0 * m;
           }
-          out[o + c] = (clamp_f32(value, 0.0, 255.0) + 0.5) as u8;
+          let mut q : f32 = 0.0;
+          if value > 0.0 {
+            q = value;
+          }
+          if q > 255.0 {
+            q = 255.0;
+          }
+          pixel = pixel | (((q + 0.5) as u32) << ((8 * c) as u32));
         }
-        out[o + 3] = 255;
+        out[oy][ox] = pixel;
       }
     }
   }
-  return to - from;
+  return;
 }
 
-// Splits the frame into bands of rows and composites each band in its own task.
-pub fn vxcam_composite(out : *mut u8, frame : *const u8, blurred : *const f32,
-mask : *const f32, crop : *const f32, w : i64, h : i64, stride : i64,
-out_stride : i64, scale : i64, mode : i64) -> void {
+// `crop` is the 4 floats that `vxcam_smooth` keeps.
+pub fn vxcam_composite(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
+frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
+mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : *const f32, w : i32, h : i32, scale : i32,
+mode : i32) -> void {
   let mut x0 : f32 = 0.0;
   let mut y0 : f32 = 0.0;
   let mut kx : f32 = 1.0;
@@ -415,19 +465,8 @@ out_stride : i64, scale : i64, mode : i64) -> void {
     kx = crop[2] / (w as f32);
     ky = crop[3] / (h as f32);
   }
-  let bands : i64 = 8;
-  let rows = (h + bands - 1) / bands;
-  tasks {
-    for b in 0..bands {
-      let bufs = CompositeBuffers {
-        out : out, frame : frame, blurred : blurred, mask : mask
-      };
-      let from = b * rows;
-      let to = min_i64(from + rows, h);
-      spawn {
-        composite_rows(bufs, x0, y0, kx, ky, w, h, stride, out_stride, scale, mode, from, to)
-      };
-    }
-  };
+  let inv_scale : f32 = 1.0 / (scale as f32);
+  composite_kernel(out, frame, blurred, mask, x0, y0, kx, ky, inv_scale, w, h, w / scale,
+  h / scale, mode);
   return;
 }
