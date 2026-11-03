@@ -1,0 +1,396 @@
+//===- vxcam.vx - The vx-cam frame pipeline ---------------------*- Vx -*-===//
+//
+// The compute stages of vx-cam: background blur with auto-framing. Every stage
+// is a `pub fn`, so the host shell calls it through the C ABI (see vxcam.h).
+// The host owns every buffer and passes it as a pointer.
+//
+// Today every stage runs on the CPU. The GPU stages arrive with the portable
+// GPU backend. Until the segmentation model exists, `vxcam_segment` finds the
+// person by background subtraction against a static background.
+//
+// Buffers:
+//   frame   BGRA8, w x h pixels, `stride` bytes per row (from the camera or video)
+//   small   RGB f32 in 0..1, sw x sh pixels, sw = w / scale and sh = h / scale
+//   mask    f32 in 0..1, sw x sh, 1 where the person is
+//   crop    4 f32: x0, y0, width, height of the output window, in frame pixels
+//
+//===----------------------------------------------------------------------===//
+
+import core::convert;
+
+fn min_f32(a : f32, b : f32) -> f32 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn max_f32(a : f32, b : f32) -> f32 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+fn clamp_f32(v : f32, lo : f32, hi : f32) -> f32 {
+  return min_f32(max_f32(v, lo), hi);
+}
+
+fn abs_f32(v : f32) -> f32 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn min_i64(a : i64, b : i64) -> i64 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn max_i64(a : i64, b : i64) -> i64 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+// 0 below `lo`, 1 above `hi`, and a smooth ramp between them.
+fn smoothstep(lo : f32, hi : f32, v : f32) -> f32 {
+  let t = clamp_f32((v - lo) / (hi - lo), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 1: preprocess. Average each scale x scale block of the frame into one
+// pixel of `small`, and convert BGRA8 to RGB f32.
+//===----------------------------------------------------------------------===//
+
+pub fn vxcam_preprocess(small : *mut f32, frame : *const u8, w : i64, h : i64, stride : i64,
+scale : i64) -> void {
+  let sw = w / scale;
+  let sh = h / scale;
+  let inv : f32 = 1.0 / ((scale * scale) as f32 * 255.0);
+  unsafe {
+    for sy in 0..sh {
+      for sx in 0..sw {
+        let mut r : f32 = 0.0;
+        let mut g : f32 = 0.0;
+        let mut b : f32 = 0.0;
+        for dy in 0..scale {
+          let row = (sy * scale + dy) * stride;
+          for dx in 0..scale {
+            let p = row + (sx * scale + dx) * 4;
+            b = b + f32::from(frame[p]);
+            g = g + f32::from(frame[p + 1]);
+            r = r + f32::from(frame[p + 2]);
+          }
+        }
+        let o = (sy * sw + sx) * 3;
+        small[o] = r * inv;
+        small[o + 1] = g * inv;
+        small[o + 2] = b * inv;
+      }
+    }
+  }
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 2: segment. A stand-in for the segmentation model: a pixel belongs to
+// the person when it differs from a running model of the background. The model
+// learns only where the mask says "background", so a person who stands still
+// is not absorbed at once. Frame 0 copies the background model from the frame.
+//===----------------------------------------------------------------------===//
+
+pub fn vxcam_segment(mask : *mut f32, background : *mut f32, small : *const f32, sw : i64,
+sh : i64, frame_index : i64) -> void {
+  let n = sw * sh;
+  unsafe {
+    if frame_index == 0 {
+      for i in 0..n * 3 {
+        background[i] = small[i];
+      }
+    }
+    for i in 0..n {
+      let o = i * 3;
+      let dr = abs_f32(small[o] - background[o]);
+      let dg = abs_f32(small[o + 1] - background[o + 1]);
+      let db = abs_f32(small[o + 2] - background[o + 2]);
+      let m = smoothstep(0.06, 0.14, max_f32(dr, max_f32(dg, db)));
+      mask[i] = m;
+      let rate : f32 = 0.02 * (1.0 - m);
+      background[o] = background[o] + rate * (small[o] - background[o]);
+      background[o + 1] = background[o + 1] + rate * (small[o + 1] - background[o + 1]);
+      background[o + 2] = background[o + 2] + rate * (small[o + 2] - background[o + 2]);
+    }
+  }
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 3: smooth. The branchy, stateful work that belongs on the CPU.
+//   - Blend the new mask into the mask kept from earlier frames, so edges do
+//     not flicker, then soften it with a small box filter.
+//   - Find the person's bounding box and move the crop window toward a frame
+//     around it. Small moves are ignored, so the window does not jitter.
+// `history` and `crop` keep their values from one frame to the next.
+//===----------------------------------------------------------------------===//
+
+// One pass of a box filter of radius `r` over one plane that starts at
+// `offset`, along rows when `step` is 1 and along columns when `step` is the
+// row length.
+fn box_pass(dst : *mut f32, src : *const f32, offset : i64, count : i64, lines : i64,
+step : i64, line_step : i64, r : i64) -> void {
+  let inv : f32 = 1.0 / ((2 * r + 1) as f32);
+  unsafe {
+    for line in 0..lines {
+      let base = offset + line * line_step;
+      let mut acc : f32 = 0.0;
+      for k in 0 - r..r + 1 {
+        acc = acc + src[base + max_i64(0, min_i64(k, count - 1)) * step];
+      }
+      for i in 0..count {
+        dst[base + i * step] = acc * inv;
+        let add = min_i64(i + r + 1, count - 1);
+        let sub = max_i64(i - r, 0);
+        acc = acc + src[base + add * step] - src[base + sub * step];
+      }
+    }
+  }
+  return;
+}
+
+pub fn vxcam_smooth(history : *mut f32, softened : *mut f32, mask : *const f32,
+crop : *mut f32, sw : i64, sh : i64, w : i64, h : i64,
+frame_index : i64) -> void {
+  let n = sw * sh;
+  let fw = w as f32;
+  let fh = h as f32;
+  unsafe {
+    // Temporal smoothing, then a soft spatial edge.
+    for i in 0..n {
+      if frame_index == 0 {
+        history[i] = mask[i];
+      } else {
+        history[i] = history[i] + 0.5 * (mask[i] - history[i]);
+      }
+    }
+    box_pass(softened, history, 0, sw, sh, 1, sw, 2);
+    box_pass(history, softened, 0, sh, sw, sw, 1, 2);
+    for i in 0..n {
+      let t = history[i];
+      softened[i] = t;
+    }
+
+    // Bounding box of the person.
+    let mut min_x = sw;
+    let mut min_y = sh;
+    let mut max_x : i64 = 0 - 1;
+    let mut max_y : i64 = 0 - 1;
+    let mut count : i64 = 0;
+    for y in 0..sh {
+      for x in 0..sw {
+        if softened[y * sw + x] > 0.5 {
+          min_x = min_i64(min_x, x);
+          max_x = max_i64(max_x, x);
+          min_y = min_i64(min_y, y);
+          max_y = max_i64(max_y, y);
+          count = count + 1;
+        }
+      }
+    }
+
+    // The window to move toward: the whole frame when nobody is there, or the
+    // person's box with some room around it, at the frame's aspect ratio.
+    let mut tw = fw;
+    let mut th = fh;
+    let mut tx : f32 = 0.0;
+    let mut ty : f32 = 0.0;
+    if count * 500 > n {
+      let sx = fw / (sw as f32);
+      let sy = fh / (sh as f32);
+      let bx0 = (min_x as f32) * sx;
+      let by0 = (min_y as f32) * sy;
+      let bw = ((max_x - min_x + 1) as f32) * sx;
+      let bh = ((max_y - min_y + 1) as f32) * sy;
+      th = clamp_f32(max_f32(bh * 1.5, bw * 1.5 * fh / fw), fh * 0.45, fh);
+      tw = th * fw / fh;
+      tx = clamp_f32(bx0 + bw * 0.5 - tw * 0.5, 0.0, fw - tw);
+      ty = clamp_f32(by0 + bh * 0.4 - th * 0.4, 0.0, fh - th);
+    }
+
+    if frame_index == 0 {
+      crop[0] = 0.0;
+      crop[1] = 0.0;
+      crop[2] = fw;
+      crop[3] = fh;
+    }
+    // Ignore moves under 3% of the frame. Otherwise ease toward the target.
+    let far = abs_f32(tx - crop[0]) + abs_f32(ty - crop[1]) + abs_f32(th - crop[3]);
+    if far > 0.03 * fh {
+      let k : f32 = 0.06;
+      crop[0] = crop[0] + k * (tx - crop[0]);
+      crop[1] = crop[1] + k * (ty - crop[1]);
+      crop[3] = crop[3] + k * (th - crop[3]);
+      crop[2] = crop[3] * fw / fh;
+    }
+  }
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 4: blur. Blur the small image with two box passes per direction, which
+// is close to a Gaussian. The composite stage scales it up to the frame, so a
+// radius of r small pixels is a radius of r * scale frame pixels.
+//===----------------------------------------------------------------------===//
+
+pub fn vxcam_blur(blurred : *mut f32, scratch : *mut f32, small : *const f32, sw : i64,
+sh : i64, radius : i64) -> void {
+  let n = sw * sh;
+  unsafe {
+    // Split RGB into planes in `blurred`, blur each plane, then interleave again.
+    for i in 0..n {
+      blurred[i] = small[i * 3];
+      blurred[n + i] = small[i * 3 + 1];
+      blurred[2 * n + i] = small[i * 3 + 2];
+    }
+    for c in 0i64..3i64 {
+      let at = c * n;
+      box_pass(scratch, blurred, at, sw, sh, 1, sw, radius);
+      box_pass(blurred, scratch, at, sh, sw, sw, 1, radius);
+      box_pass(scratch, blurred, at, sw, sh, 1, sw, radius);
+      box_pass(blurred, scratch, at, sh, sw, sw, 1, radius);
+    }
+    for i in 0..n {
+      scratch[i * 3] = blurred[i];
+      scratch[i * 3 + 1] = blurred[n + i];
+      scratch[i * 3 + 2] = blurred[2 * n + i];
+    }
+    for i in 0..n * 3 {
+      blurred[i] = scratch[i];
+    }
+  }
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 5: composite. For each output pixel, find where it comes from inside the
+// crop window, then mix the sharp frame and the blurred background by the mask.
+// `mode` 0 is the normal output, 1 shows the mask, 2 turns the blur off.
+//===----------------------------------------------------------------------===//
+
+// Bilinear mix of four neighbours: a and b on the top row, d and e below.
+fn lerp2(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32) -> f32 {
+  let top = a + fx * (b - a);
+  let bottom = d + fx * (e - d);
+  return top + fy * (bottom - top);
+}
+
+// The buffers of one composite call. A raw pointer is not `Send`, so a task
+// cannot take one by itself. Each task writes only its own rows of `out`, so
+// no two tasks write the same byte.
+struct CompositeBuffers {
+  out : *mut u8,
+  frame : *const u8,
+  blurred : *const f32,
+  mask : *const f32,
+}
+unsafe impl Send for CompositeBuffers {}
+
+// Rows `from` to `to` of the output. The crop window is x0, y0 and the scale
+// kx, ky from output pixels to frame pixels.
+fn composite_rows(bufs : CompositeBuffers, x0 : f32, y0 : f32, kx : f32, ky : f32, w : i64,
+h : i64, stride : i64, out_stride : i64, scale : i64, mode : i64, from : i64, to : i64) -> i64 {
+  let out = bufs.out;
+  let frame = bufs.frame;
+  let blurred = bufs.blurred;
+  let mask = bufs.mask;
+  let sw = w / scale;
+  let sh = h / scale;
+  let inv_scale : f32 = 1.0 / (scale as f32);
+  unsafe {
+    for oy in from..to {
+      // Where this row comes from, in the frame and in the small images.
+      let sy = clamp_f32(y0 + ((oy as f32) + 0.5) * ky - 0.5, 0.0, (h - 1) as f32);
+      let iy0 = sy as i64;
+      let iy1 = min_i64(iy0 + 1, h - 1);
+      let fy = sy - iy0 as f32;
+      let v = clamp_f32((sy + 0.5) * inv_scale - 0.5, 0.0, (sh - 1) as f32);
+      let vy0 = v as i64;
+      let vy1 = min_i64(vy0 + 1, sh - 1);
+      let gy = v - vy0 as f32;
+      for ox in 0..w {
+        let sx = clamp_f32(x0 + ((ox as f32) + 0.5) * kx - 0.5, 0.0, (w - 1) as f32);
+        let ix0 = sx as i64;
+        let ix1 = min_i64(ix0 + 1, w - 1);
+        let fx = sx - ix0 as f32;
+        let u = clamp_f32((sx + 0.5) * inv_scale - 0.5, 0.0, (sw - 1) as f32);
+        let ux0 = u as i64;
+        let ux1 = min_i64(ux0 + 1, sw - 1);
+        let gx = u - ux0 as f32;
+        let q00 = vy0 * sw + ux0;
+        let q01 = vy0 * sw + ux1;
+        let q10 = vy1 * sw + ux0;
+        let q11 = vy1 * sw + ux1;
+        let m = lerp2(mask[q00], mask[q01], mask[q10], mask[q11], gx, gy);
+        let o = oy * out_stride + ox * 4;
+        let p00 = iy0 * stride + ix0 * 4;
+        let p01 = iy0 * stride + ix1 * 4;
+        let p10 = iy1 * stride + ix0 * 4;
+        let p11 = iy1 * stride + ix1 * 4;
+        for c in 0i64..3i64 {
+          // BGRA in the frame, RGB in `blurred`.
+          let sharp = lerp2(f32::from(frame[p00 + c]), f32::from(frame[p01 + c]),
+          f32::from(frame[p10 + c]), f32::from(frame[p11 + c]), fx, fy);
+          let k = 2 - c;
+          let mut value = sharp;
+          if mode == 0 {
+            let soft = 255.0 * lerp2(blurred[q00 * 3 + k], blurred[q01 * 3 + k],
+            blurred[q10 * 3 + k], blurred[q11 * 3 + k], gx, gy);
+            value = soft + m * (sharp - soft);
+          }
+          if mode == 1 {
+            value = 0.25 * sharp + 0.75 * 255.0 * m;
+          }
+          out[o + c] = (clamp_f32(value, 0.0, 255.0) + 0.5) as u8;
+        }
+        out[o + 3] = 255;
+      }
+    }
+  }
+  return to - from;
+}
+
+// Splits the frame into bands of rows and composites each band in its own task.
+pub fn vxcam_composite(out : *mut u8, frame : *const u8, blurred : *const f32,
+mask : *const f32, crop : *const f32, w : i64, h : i64, stride : i64,
+out_stride : i64, scale : i64, mode : i64) -> void {
+  let mut x0 : f32 = 0.0;
+  let mut y0 : f32 = 0.0;
+  let mut kx : f32 = 1.0;
+  let mut ky : f32 = 1.0;
+  unsafe {
+    x0 = crop[0];
+    y0 = crop[1];
+    kx = crop[2] / (w as f32);
+    ky = crop[3] / (h as f32);
+  }
+  let bands : i64 = 8;
+  let rows = (h + bands - 1) / bands;
+  tasks {
+    for b in 0..bands {
+      let bufs = CompositeBuffers {
+        out : out, frame : frame, blurred : blurred, mask : mask
+      };
+      let from = b * rows;
+      let to = min_i64(from + rows, h);
+      spawn {
+        composite_rows(bufs, x0, y0, kx, ky, w, h, stride, out_stride, scale, mode, from, to)
+      };
+    }
+  };
+  return;
+}
