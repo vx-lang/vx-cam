@@ -11,9 +11,6 @@
 extern "C" {
 #endif
 
-void vxcam_segment(float *mask, float *background, const float *small, int64_t sw, int64_t sh,
-                   int64_t frame_index);
-
 void vxcam_smooth(float *history, float *softened, const float *mask, float *crop, int64_t sw,
                   int64_t sh, int64_t w, int64_t h, int64_t frame_index);
 
@@ -32,6 +29,7 @@ void vx_metal_set_enabled(int on);
 //   frame    BGRA8, h rows of `stride` bytes
 //   small    RGB f32, sh rows of 3 * sw floats; blurred and scratch the same
 //   mask     f32, sh rows of sw floats
+//   background  RGB f32 like small; segment updates it in place each frame
 //   out      BGRA8, h rows of w pixels; the kernel writes each pixel as one uint32_t
 
 void vxcam_preprocess(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(const uint8_t),
@@ -42,6 +40,16 @@ static inline void vxcam_preprocess_frame(float *small, const uint8_t *frame, in
   int64_t sw = w / scale, sh = h / scale;
   vxcam_preprocess(VXCAM_TENSOR2(small, sh, 3 * sw), VXCAM_TENSOR2(frame, h, stride),
                    (int32_t)sw, (int32_t)sh, scale);
+}
+
+void vxcam_segment(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
+                   VXCAM_TENSOR2_ARGS(const float), int32_t sw, int32_t sh, int32_t frame_index);
+
+static inline void vxcam_segment_image(float *mask, float *background, const float *small,
+                                       int64_t sw, int64_t sh, int64_t frame_index) {
+  vxcam_segment(VXCAM_TENSOR2(mask, sh, sw), VXCAM_TENSOR2(background, sh, 3 * sw),
+                VXCAM_TENSOR2(small, sh, 3 * sw), (int32_t)sw, (int32_t)sh,
+                (int32_t)frame_index);
 }
 
 void vxcam_blur(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),

@@ -115,28 +115,74 @@ frame : &Tensor<u8, [?, ?], Memory::HBM>, sw : i32, sh : i32, scale : i32) -> vo
 // is not absorbed at once. Frame 0 copies the background model from the frame.
 //===----------------------------------------------------------------------===//
 
-pub fn vxcam_segment(mask : *mut f32, background : *mut f32, small : *const f32, sw : i64,
-sh : i64, frame_index : i64) -> void {
-  let n = sw * sh;
-  unsafe {
-    if frame_index == 0 {
-      for i in 0..n * 3 {
-        background[i] = small[i];
+// A GPU kernel, one lane per pixel. `small` and `background` are `[sh, 3 * sw]`,
+// `mask` is `[sh, sw]`. `first` is 1 on frame 0. The work is written out as in
+// composite: abs, max and smoothstep(0.06, 0.14, d) as abs_f32, max_f32 and
+// smoothstep compute them.
+fn segment_kernel(mask : &mut Tensor<f32, [?, ?], Memory::HBM>,
+background : &mut Tensor<f32, [?, ?], Memory::HBM>, small : &Tensor<f32, [?, ?], Memory::HBM>,
+sw : i32, sh : i32, first : i32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..sh across blocks {
+      for x in 0..sw across lanes(256) {
+        let r = small[y][x * 3];
+        let g = small[y][x * 3 + 1];
+        let b = small[y][x * 3 + 2];
+        let mut br = background[y][x * 3];
+        let mut bg = background[y][x * 3 + 1];
+        let mut bb = background[y][x * 3 + 2];
+        if first == 1 {
+          br = r;
+          bg = g;
+          bb = b;
+        }
+        let mut dr = r - br;
+        if dr < 0.0 {
+          dr = 0.0 - dr;
+        }
+        let mut dg = g - bg;
+        if dg < 0.0 {
+          dg = 0.0 - dg;
+        }
+        let mut db = b - bb;
+        if db < 0.0 {
+          db = 0.0 - db;
+        }
+        let mut d = db;
+        if dg > db {
+          d = dg;
+        }
+        if dr > d {
+          d = dr;
+        }
+        let ramp = (d - 0.06) / (0.14 - 0.06);
+        let mut t : f32 = 0.0;
+        if ramp > 0.0 {
+          t = ramp;
+        }
+        if t > 1.0 {
+          t = 1.0;
+        }
+        let m = t * t * (3.0 - 2.0 * t);
+        mask[y][x] = m;
+        let rate : f32 = 0.02 * (1.0 - m);
+        background[y][x * 3] = br + rate * (r - br);
+        background[y][x * 3 + 1] = bg + rate * (g - bg);
+        background[y][x * 3 + 2] = bb + rate * (b - bb);
       }
     }
-    for i in 0..n {
-      let o = i * 3;
-      let dr = abs_f32(small[o] - background[o]);
-      let dg = abs_f32(small[o + 1] - background[o + 1]);
-      let db = abs_f32(small[o + 2] - background[o + 2]);
-      let m = smoothstep(0.06, 0.14, max_f32(dr, max_f32(dg, db)));
-      mask[i] = m;
-      let rate : f32 = 0.02 * (1.0 - m);
-      background[o] = background[o] + rate * (small[o] - background[o]);
-      background[o + 1] = background[o + 1] + rate * (small[o + 1] - background[o + 1]);
-      background[o + 2] = background[o + 2] + rate * (small[o + 2] - background[o + 2]);
-    }
   }
+  return;
+}
+
+pub fn vxcam_segment(mask : &mut Tensor<f32, [?, ?], Memory::HBM>,
+background : &mut Tensor<f32, [?, ?], Memory::HBM>, small : &Tensor<f32, [?, ?], Memory::HBM>,
+sw : i32, sh : i32, frame_index : i32) -> void {
+  let mut first : i32 = 0;
+  if frame_index == 0 {
+    first = 1;
+  }
+  segment_kernel(mask, background, small, sw, sh, first);
   return;
 }
 

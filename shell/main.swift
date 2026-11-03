@@ -100,7 +100,7 @@ final class Pipeline {
   var blurRadius = 4
   var stages = ["preprocess", "segment", "smooth", "blur", "composite"].map { StageInfo(name: $0) }
   /// The stages that are GPU kernels. The others are CPU code.
-  static let kernelStages: Set<Int> = [0, 3, 4]
+  static let kernelStages: Set<Int> = [0, 1, 3, 4]
   var frameMs: Double = 0
 
   // Every buffer is shared: a stage on either device reads and writes it in place.
@@ -141,6 +141,11 @@ final class Pipeline {
     vxcam_preprocess_frame(small.ptr, frame, Int64(w), Int64(h), Int64(stride), Int32(scale))
   }
 
+  private func runSegment(onGPU: Bool) {
+    vx_metal_set_enabled(onGPU ? 1 : 0)
+    vxcam_segment_image(mask.ptr, background.ptr, small.ptr, Int64(sw), Int64(sh), Int64(frameIndex))
+  }
+
   private func runBlur(onGPU: Bool) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     vxcam_blur_image(blurred.ptr, scratch.ptr, small.ptr, Int64(sw), Int64(sh), Int32(blurRadius))
@@ -155,9 +160,13 @@ final class Pipeline {
 
   /// Runs `run` on the CPU, then on the GPU over each fill of `buf`, and compares the
   /// bits. A GPU run that skips an element cannot match, because no element equals
-  /// every fill: NaN for floats, 0x00 and then 0xFF for bytes.
-  private func compare<T>(_ name: String, _ buf: Shared<T>, fills: [Int32],
-                          _ value: (T) -> Double, _ run: (Bool) -> Void) -> String {
+  /// every fill: NaN for floats, 0x00 and then 0xFF for bytes. A nil fill leaves `buf`
+  /// as `reset` left it, for a buffer that the stage reads as well as writes. `reset`
+  /// runs before each run, to put back the state that a stage keeps between frames.
+  private func compare<T>(_ name: String, _ buf: Shared<T>, fills: [Int32?],
+                          _ value: (T) -> Double, reset: () -> Void = {},
+                          _ run: (Bool) -> Void) -> String {
+    reset()
     run(false)
     let cpu = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
     defer { cpu.deallocate() }
@@ -166,7 +175,8 @@ final class Pipeline {
     var differ = 0
     var worst = 0.0
     for fill in fills {
-      memset(buf.ptr, fill, buf.bytes)
+      reset()
+      if let fill { memset(buf.ptr, fill, buf.bytes) }
       run(true)
       for i in 0..<buf.count where memcmp(cpu + i, buf.ptr + i, size) != 0 {
         differ += 1
@@ -182,8 +192,13 @@ final class Pipeline {
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
     let stride = CVPixelBufferGetBytesPerRow(pb)
+    // segment updates the background model in place, so each run starts from a copy.
+    let saved = Array(UnsafeBufferPointer(start: background.ptr, count: background.count))
+    let restore = { _ = saved.withUnsafeBufferPointer { memcpy(self.background.ptr, $0.baseAddress!, saved.count * 4) } }
     return [
       compare("preprocess", small, fills: [-1], { Double($0) }) { runPreprocess(frame, stride, onGPU: $0) },
+      compare("segment mask", mask, fills: [-1], { Double($0) }, reset: restore) { runSegment(onGPU: $0) },
+      compare("segment background", background, fills: [nil], { Double($0) }, reset: restore) { runSegment(onGPU: $0) },
       compare("blur", blurred, fills: [-1], { Double($0) }) { runBlur(onGPU: $0) },
       compare("composite", out, fills: [0x00, 0xFF], { Double($0) }) { runComposite(frame, stride, onGPU: $0) },
     ]
@@ -207,7 +222,7 @@ final class Pipeline {
     let (W, H, SW, SH, F) = (Int64(w), Int64(h), Int64(sw), Int64(sh), Int64(frameIndex))
     let start = DispatchTime.now().uptimeNanoseconds
     timed(0) { runPreprocess(frame, stride, onGPU: onGPU(0)) }
-    timed(1) { vxcam_segment(mask.ptr, background.ptr, small.ptr, SW, SH, F) }
+    timed(1) { runSegment(onGPU: onGPU(1)) }
     timed(2) { vxcam_smooth(history.ptr, softened.ptr, mask.ptr, &crop, SW, SH, W, H, F) }
     timed(3) { runBlur(onGPU: onGPU(3)) }
     timed(4) { runComposite(frame, stride, onGPU: onGPU(4)) }
