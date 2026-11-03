@@ -2,12 +2,11 @@
 //
 // The compute stages of vx-cam: background blur with auto-framing. Every stage
 // is a `pub fn`, so the host shell calls it through the C ABI (see vxcam.h).
-// The host owns every buffer: the CPU stages take it as a pointer, and the GPU
-// stages as a tensor.
+// The host owns every buffer and passes each one as a tensor.
 //
-// preprocess, blur and composite are GPU kernels. vxc also compiles a CPU copy
-// of each, and `vx_metal_set_enabled` picks one for the calling thread. segment
-// and smooth run on the CPU. Until the segmentation model exists,
+// Every stage is GPU kernels. vxc also compiles a CPU copy of each kernel, and
+// `vx_metal_set_enabled` picks one for the calling thread, so each stage runs
+// on either device from one source. Until the segmentation model exists,
 // `vxcam_segment` finds the person by background subtraction against a static
 // background.
 //
@@ -15,54 +14,16 @@
 //   frame   BGRA8, w x h pixels, `stride` bytes per row (from the camera or video)
 //   small   RGB f32 in 0..1, sw x sh pixels, sw = w / scale and sh = h / scale
 //   mask    f32 in 0..1, sw x sh, 1 where the person is
-//   crop    4 f32: x0, y0, width, height of the output window, in frame pixels
+//   crop    [1, 4] f32: x0, y0, width, height of the output window, in frame pixels
 //
 //===----------------------------------------------------------------------===//
 
-fn min_f32(a : f32, b : f32) -> f32 {
-  if a < b {
-    return a;
-  }
-  return b;
-}
-
-fn max_f32(a : f32, b : f32) -> f32 {
-  if a > b {
-    return a;
-  }
-  return b;
-}
-
-fn clamp_f32(v : f32, lo : f32, hi : f32) -> f32 {
-  return min_f32(max_f32(v, lo), hi);
-}
-
-fn abs_f32(v : f32) -> f32 {
-  if v < 0.0 {
-    return 0.0 - v;
-  }
-  return v;
-}
-
-fn min_i64(a : i64, b : i64) -> i64 {
-  if a < b {
-    return a;
-  }
-  return b;
-}
-
-fn max_i64(a : i64, b : i64) -> i64 {
-  if a > b {
-    return a;
-  }
-  return b;
-}
-
-// 0 below `lo`, 1 above `hi`, and a smooth ramp between them.
-fn smoothstep(lo : f32, hi : f32, v : f32) -> f32 {
-  let t = clamp_f32((v - lo) / (hi - lo), 0.0, 1.0);
-  return t * t * (3.0 - 2.0 * t);
-}
+//===----------------------------------------------------------------------===//
+// How the kernels are written. A clamp of v to [lo, hi] is "lo, or v if v > lo;
+// then hi if that is above hi". A max of a and b is "a if a > b, else b". An
+// abs is "0 - v if v < 0". Each is written out where it is used: vxc's Metal
+// generator does not inline calls to helper functions yet.
+//===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
 // Stage 1: preprocess. Average each scale x scale block of the frame into one
@@ -116,9 +77,9 @@ frame : &Tensor<u8, [?, ?], Memory::HBM>, sw : i32, sh : i32, scale : i32) -> vo
 //===----------------------------------------------------------------------===//
 
 // A GPU kernel, one lane per pixel. `small` and `background` are `[sh, 3 * sw]`,
-// `mask` is `[sh, sw]`. `first` is 1 on frame 0. The work is written out as in
-// composite: abs, max and smoothstep(0.06, 0.14, d) as abs_f32, max_f32 and
-// smoothstep compute them.
+// `mask` is `[sh, sw]`. `first` is 1 on frame 0. The mask is
+// smoothstep(0.06, 0.14, d), where d is the largest difference of the three
+// channels from the background model.
 fn segment_kernel(mask : &mut Tensor<f32, [?, ?], Memory::HBM>,
 background : &mut Tensor<f32, [?, ?], Memory::HBM>, small : &Tensor<f32, [?, ?], Memory::HBM>,
 sw : i32, sh : i32, first : i32) -> void {
@@ -192,108 +153,237 @@ sw : i32, sh : i32, frame_index : i32) -> void {
 //     not flicker, then soften it with a small box filter.
 //   - Find the person's bounding box and move the crop window toward a frame
 //     around it. Small moves are ignored, so the window does not jitter.
-// `history` and `crop` keep their values from one frame to the next.
+// `history` and `crop` keep their values from one frame to the next. After the
+// stage, `history` is the softened mask that composite reads.
+//
+// Four GPU kernels, so the stage can move to the GPU like the others: the blend
+// and the box filter along rows, the box filter along columns, each row's part
+// of the bounding box, and one GPU thread for the rest. Host code cannot read
+// a tensor in HBM (E6003), even on unified memory, so the serial rest is a
+// kernel too. Each image is `[sh, sw]`, and `stats` is `[sh, 3]`.
 //===----------------------------------------------------------------------===//
 
-// One pass of a box filter of radius `r` over one plane that starts at
-// `offset`, along rows when `step` is 1 and along columns when `step` is the
-// row length.
-fn box_pass(dst : *mut f32, src : *const f32, offset : i64, count : i64, lines : i64,
-step : i64, line_step : i64, r : i64) -> void {
-  let inv : f32 = 1.0 / ((2 * r + 1) as f32);
-  unsafe {
-    for line in 0..lines {
-      let base = offset + line * line_step;
-      let mut acc : f32 = 0.0;
-      for k in 0 - r..r + 1 {
-        acc = acc + src[base + max_i64(0, min_i64(k, count - 1)) * step];
-      }
-      for i in 0..count {
-        dst[base + i * step] = acc * inv;
-        let add = min_i64(i + r + 1, count - 1);
-        let sub = max_i64(i - r, 0);
-        acc = acc + src[base + add * step] - src[base + sub * step];
+// scratch = the box filter of radius 2 along each row of the blend of `mask`
+// into `history`. On frame 0 (`first` is 1) the blend is the mask itself.
+fn smooth_rows(scratch : &mut Tensor<f32, [?, ?], Memory::HBM>,
+history : &Tensor<f32, [?, ?], Memory::HBM>, mask : &Tensor<f32, [?, ?], Memory::HBM>,
+sw : i32, sh : i32, first : i32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..sh across blocks {
+      for x in 0..sw across lanes(256) {
+        let mut acc : f32 = 0.0;
+        for d in 0..5 {
+          let mut xx = x + d - 2;
+          if xx < 0 {
+            xx = 0;
+          }
+          if xx > sw - 1 {
+            xx = sw - 1;
+          }
+          let old = history[y][xx];
+          let new = mask[y][xx];
+          let mut blend = old + 0.5 * (new - old);
+          if first == 1 {
+            blend = new;
+          }
+          // Where the person has left, the blend halves each frame and would
+          // reach the subnormal floats. The GPU flushes those to zero and the
+          // CPU does not, so the two devices would differ. Zero it well before.
+          if blend < 0.000001 {
+            blend = 0.0;
+          }
+          acc = acc + blend;
+        }
+        scratch[y][x] = acc / 5.0;
       }
     }
   }
   return;
 }
 
-pub fn vxcam_smooth(history : *mut f32, softened : *mut f32, mask : *const f32,
-crop : *mut f32, sw : i64, sh : i64, w : i64, h : i64,
-frame_index : i64) -> void {
-  let n = sw * sh;
-  let fw = w as f32;
-  let fh = h as f32;
-  unsafe {
-    // Temporal smoothing, then a soft spatial edge.
-    for i in 0..n {
-      if frame_index == 0 {
-        history[i] = mask[i];
-      } else {
-        history[i] = history[i] + 0.5 * (mask[i] - history[i]);
+// history = the box filter of radius 2 along each column of scratch.
+fn smooth_cols(history : &mut Tensor<f32, [?, ?], Memory::HBM>,
+scratch : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..sh across blocks {
+      for x in 0..sw across lanes(256) {
+        let mut acc : f32 = 0.0;
+        for d in 0..5 {
+          let mut yy = y + d - 2;
+          if yy < 0 {
+            yy = 0;
+          }
+          if yy > sh - 1 {
+            yy = sh - 1;
+          }
+          acc = acc + scratch[yy][x];
+        }
+        history[y][x] = acc / 5.0;
       }
     }
-    box_pass(softened, history, 0, sw, sh, 1, sw, 2);
-    box_pass(history, softened, 0, sh, sw, sw, 1, 2);
-    for i in 0..n {
-      let t = history[i];
-      softened[i] = t;
-    }
+  }
+  return;
+}
 
-    // Bounding box of the person.
+// For each row y, one lane finds the first and the last x where the person is
+// (history > 0.5) and how many such pixels there are: stats[y] = [first, last,
+// count], or [sw, -1, 0] for a row without the person.
+fn row_stats(stats : &mut Tensor<i32, [?, ?], Memory::HBM>,
+history : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
+  spawn on(Topology::Device) {
+    for g in 0..(sh + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let y = g * 256 + l;
+        if y < sh {
+          let mut lo = sw;
+          let mut hi : i32 = 0 - 1;
+          let mut n : i32 = 0;
+          for x in 0..sw {
+            if history[y][x] > 0.5 {
+              if x < lo {
+                lo = x;
+              }
+              hi = x;
+              n = n + 1;
+            }
+          }
+          stats[y][0] = lo;
+          stats[y][1] = hi;
+          stats[y][2] = n;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The rest of the stage, as one GPU thread (a region with no `across` loop):
+// reduce the rows to one bounding box, then move the crop window toward a frame
+// around it. This is serial work, slow on a GPU thread, which the overlay shows.
+// `crop` is `[1, 4]`.
+fn frame_crop(crop : &mut Tensor<f32, [?, ?], Memory::HBM>,
+stats : &Tensor<i32, [?, ?], Memory::HBM>, sw : i32, sh : i32, w : i32, h : i32,
+first : i32) -> void {
+  spawn on(Topology::Device) {
+    // Bounding box of the person, from the rows.
     let mut min_x = sw;
     let mut min_y = sh;
-    let mut max_x : i64 = 0 - 1;
-    let mut max_y : i64 = 0 - 1;
-    let mut count : i64 = 0;
+    let mut max_x : i32 = 0 - 1;
+    let mut max_y : i32 = 0 - 1;
+    let mut count : i32 = 0;
     for y in 0..sh {
-      for x in 0..sw {
-        if softened[y * sw + x] > 0.5 {
-          min_x = min_i64(min_x, x);
-          max_x = max_i64(max_x, x);
-          min_y = min_i64(min_y, y);
-          max_y = max_i64(max_y, y);
-          count = count + 1;
+      let n = stats[y][2];
+      if n > 0 {
+        if stats[y][0] < min_x {
+          min_x = stats[y][0];
         }
+        if stats[y][1] > max_x {
+          max_x = stats[y][1];
+        }
+        if y < min_y {
+          min_y = y;
+        }
+        max_y = y;
+        count = count + n;
       }
     }
 
     // The window to move toward: the whole frame when nobody is there, or the
     // person's box with some room around it, at the frame's aspect ratio.
-    let mut tw = fw;
+    let fw = w as f32;
+    let fh = h as f32;
     let mut th = fh;
     let mut tx : f32 = 0.0;
     let mut ty : f32 = 0.0;
-    if count * 500 > n {
+    if count * 500 > sw * sh {
       let sx = fw / (sw as f32);
       let sy = fh / (sh as f32);
       let bx0 = (min_x as f32) * sx;
       let by0 = (min_y as f32) * sy;
       let bw = ((max_x - min_x + 1) as f32) * sx;
       let bh = ((max_y - min_y + 1) as f32) * sy;
-      th = clamp_f32(max_f32(bh * 1.5, bw * 1.5 * fh / fw), fh * 0.45, fh);
-      tw = th * fw / fh;
-      tx = clamp_f32(bx0 + bw * 0.5 - tw * 0.5, 0.0, fw - tw);
-      ty = clamp_f32(by0 + bh * 0.4 - th * 0.4, 0.0, fh - th);
+      // th = clamp(max(bh * 1.5, bw * 1.5 * fh / fw), fh * 0.45, fh)
+      let tall = bh * 1.5;
+      let wide = bw * 1.5 * fh / fw;
+      let mut big = wide;
+      if tall > wide {
+        big = tall;
+      }
+      th = fh * 0.45;
+      if big > th {
+        th = big;
+      }
+      if th > fh {
+        th = fh;
+      }
+      let tw = th * fw / fh;
+      // tx = clamp(bx0 + bw * 0.5 - tw * 0.5, 0, fw - tw), and ty the same way.
+      let ax = bx0 + bw * 0.5 - tw * 0.5;
+      if ax > 0.0 {
+        tx = ax;
+      }
+      if tx > fw - tw {
+        tx = fw - tw;
+      }
+      let ay = by0 + bh * 0.4 - th * 0.4;
+      if ay > 0.0 {
+        ty = ay;
+      }
+      if ty > fh - th {
+        ty = fh - th;
+      }
     }
 
-    if frame_index == 0 {
-      crop[0] = 0.0;
-      crop[1] = 0.0;
-      crop[2] = fw;
-      crop[3] = fh;
+    let mut c0 = crop[0][0];
+    let mut c1 = crop[0][1];
+    let mut c2 = crop[0][2];
+    let mut c3 = crop[0][3];
+    if first == 1 {
+      c0 = 0.0;
+      c1 = 0.0;
+      c2 = fw;
+      c3 = fh;
     }
     // Ignore moves under 3% of the frame. Otherwise ease toward the target.
-    let far = abs_f32(tx - crop[0]) + abs_f32(ty - crop[1]) + abs_f32(th - crop[3]);
-    if far > 0.03 * fh {
-      let k : f32 = 0.06;
-      crop[0] = crop[0] + k * (tx - crop[0]);
-      crop[1] = crop[1] + k * (ty - crop[1]);
-      crop[3] = crop[3] + k * (th - crop[3]);
-      crop[2] = crop[3] * fw / fh;
+    let mut dx = tx - c0;
+    if dx < 0.0 {
+      dx = 0.0 - dx;
     }
+    let mut dy = ty - c1;
+    if dy < 0.0 {
+      dy = 0.0 - dy;
+    }
+    let mut dh = th - c3;
+    if dh < 0.0 {
+      dh = 0.0 - dh;
+    }
+    if dx + dy + dh > 0.03 * fh {
+      let k : f32 = 0.06;
+      c0 = c0 + k * (tx - c0);
+      c1 = c1 + k * (ty - c1);
+      c3 = c3 + k * (th - c3);
+      c2 = c3 * fw / fh;
+    }
+    crop[0][0] = c0;
+    crop[0][1] = c1;
+    crop[0][2] = c2;
+    crop[0][3] = c3;
   }
+  return;
+}
+
+pub fn vxcam_smooth(history : &mut Tensor<f32, [?, ?], Memory::HBM>,
+scratch : &mut Tensor<f32, [?, ?], Memory::HBM>, mask : &Tensor<f32, [?, ?], Memory::HBM>,
+stats : &mut Tensor<i32, [?, ?], Memory::HBM>, crop : &mut Tensor<f32, [?, ?], Memory::HBM>,
+sw : i32, sh : i32, w : i32, h : i32, frame_index : i32) -> void {
+  let mut first : i32 = 0;
+  if frame_index == 0 {
+    first = 1;
+  }
+  smooth_rows(scratch, history, mask, sw, sh, first);
+  smooth_cols(history, scratch, sw, sh);
+  row_stats(stats, history, sw, sh);
+  frame_crop(crop, stats, sw, sh, w, h, first);
   return;
 }
 
@@ -379,22 +469,24 @@ rows : i32, cols : i32, radius : i32) -> void {
 // `mask` is `[sh, sw]`.
 //===----------------------------------------------------------------------===//
 
-// The crop window is x0, y0 and the scale kx, ky from output pixels to frame
-// pixels. `inv_scale` is 1 / scale, from frame pixels to small pixels.
+// `crop` is `[1, 4]`: x0, y0, width and height of the window, in frame pixels.
+// `inv_scale` is 1 / scale, from frame pixels to small pixels.
 //
 // Each lane writes its pixel as one u32 (B, G, R, A from the low byte up), so
-// the race checker sees that no two lanes write the same element. The work is
-// written out in the loop, without helper functions: vxc's Metal generator does
-// not inline calls yet. Each clamp is max with the low end, then min with the
-// high end, as clamp_f32 does. Each bilinear mix is a + fx * (b - a) along the
-// row, then the same down the column.
+// the race checker sees that no two lanes write the same element. Each bilinear
+// mix is a + fx * (b - a) along the row, then the same down the column.
 fn composite_kernel(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
-mask : &Tensor<f32, [?, ?], Memory::HBM>, x0 : f32, y0 : f32, kx : f32, ky : f32,
+mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::HBM>,
 inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
   spawn on(Topology::Device) {
     for oy in 0..h across blocks {
       for ox in 0..w across lanes(256) {
+        // The window's corner, and the scale from output pixels to frame pixels.
+        let x0 = crop[0][0];
+        let y0 = crop[0][1];
+        let kx = crop[0][2] / (w as f32);
+        let ky = crop[0][3] / (h as f32);
         // Where this pixel comes from: sy, sx in the frame, v, u in the small images.
         let ty = y0 + ((oy as f32) + 0.5) * ky - 0.5;
         let mut sy : f32 = 0.0;
@@ -496,23 +588,12 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
   return;
 }
 
-// `crop` is the 4 floats that `vxcam_smooth` keeps.
+// `crop` is the window that `vxcam_smooth` keeps, or the whole frame.
 pub fn vxcam_composite(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
-mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : *const f32, w : i32, h : i32, scale : i32,
-mode : i32) -> void {
-  let mut x0 : f32 = 0.0;
-  let mut y0 : f32 = 0.0;
-  let mut kx : f32 = 1.0;
-  let mut ky : f32 = 1.0;
-  unsafe {
-    x0 = crop[0];
-    y0 = crop[1];
-    kx = crop[2] / (w as f32);
-    ky = crop[3] / (h as f32);
-  }
+mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::HBM>, w : i32,
+h : i32, scale : i32, mode : i32) -> void {
   let inv_scale : f32 = 1.0 / (scale as f32);
-  composite_kernel(out, frame, blurred, mask, x0, y0, kx, ky, inv_scale, w, h, w / scale,
-  h / scale, mode);
+  composite_kernel(out, frame, blurred, mask, crop, inv_scale, w, h, w / scale, h / scale, mode);
   return;
 }

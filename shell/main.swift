@@ -98,16 +98,16 @@ final class Pipeline {
   var mode = 0            // 0 normal, 1 mask, 2 no blur
   var autoFraming = true
   var blurRadius = 4
+  /// Every stage is GPU kernels, and each can run on either device.
   var stages = ["preprocess", "segment", "smooth", "blur", "composite"].map { StageInfo(name: $0) }
-  /// The stages that are GPU kernels. The others are CPU code.
-  static let kernelStages: Set<Int> = [0, 1, 3, 4]
   var frameMs: Double = 0
 
   // Every buffer is shared: a stage on either device reads and writes it in place.
   let out: Shared<UInt8>
-  private let small, blurred, scratch, background, mask, history, softened: Shared<Float>
-  private var crop = [Float](repeating: 0, count: 4)
-  private var fullFrame: [Float]
+  private let small, blurred, scratch, background, mask, history, maskScratch: Shared<Float>
+  private let stats: Shared<Int32>
+  /// The crop window that smooth keeps, and the whole frame for when framing is off.
+  private let crop, fullFrame: Shared<Float>
 
   /// `gpu` names the stages that start on the GPU: "all", or names separated by commas.
   init(w: Int, h: Int, gpu: String = ProcessInfo.processInfo.environment["VXCAM_GPU"] ?? "") {
@@ -120,17 +120,20 @@ final class Pipeline {
     background = Shared(count: n * 3)
     mask = Shared(count: n)
     history = Shared(count: n)
-    softened = Shared(count: n)
-    fullFrame = [0, 0, Float(w), Float(h)]
+    maskScratch = Shared(count: n)
+    stats = Shared(count: (h / 4) * 3)
+    crop = Shared(count: 4)
+    fullFrame = Shared(count: 4)
+    fullFrame.ptr[2] = Float(w)
+    fullFrame.ptr[3] = Float(h)
     let names = Set(gpu.split(separator: ",").map(String.init))
-    for i in Self.kernelStages where gpu == "all" || names.contains(stages[i].name) {
+    for i in stages.indices where gpu == "all" || names.contains(stages[i].name) {
       stages[i].device = "GPU"
     }
   }
 
   /// Moves a stage between the CPU and the GPU.
   func toggle(stage i: Int) -> String {
-    guard Self.kernelStages.contains(i) else { return "\(stages[i].name) is CPU code, not a GPU kernel" }
     stages[i].device = stages[i].device == "GPU" ? "CPU" : "GPU"
     return "\(stages[i].name) now runs on the \(stages[i].device)"
   }
@@ -146,6 +149,12 @@ final class Pipeline {
     vxcam_segment_image(mask.ptr, background.ptr, small.ptr, Int64(sw), Int64(sh), Int64(frameIndex))
   }
 
+  private func runSmooth(onGPU: Bool) {
+    vx_metal_set_enabled(onGPU ? 1 : 0)
+    vxcam_smooth_mask(history.ptr, maskScratch.ptr, mask.ptr, stats.ptr, crop.ptr, Int64(sw),
+                      Int64(sh), Int64(w), Int64(h), Int64(frameIndex))
+  }
+
   private func runBlur(onGPU: Bool) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     vxcam_blur_image(blurred.ptr, scratch.ptr, small.ptr, Int64(sw), Int64(sh), Int32(blurRadius))
@@ -154,7 +163,7 @@ final class Pipeline {
   private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     let window = autoFraming ? crop : fullFrame
-    vxcam_composite_frame(out.ptr, frame, blurred.ptr, softened.ptr, window, Int64(w), Int64(h),
+    vxcam_composite_frame(out.ptr, frame, blurred.ptr, history.ptr, window.ptr, Int64(w), Int64(h),
                           Int64(stride), Int32(scale), Int32(mode))
   }
 
@@ -186,19 +195,32 @@ final class Pipeline {
     return "\(name) CPU vs GPU: \(differ) of \(buf.count * fills.count) values differ (largest difference \(worst))"
   }
 
-  /// Runs each GPU stage on both devices over `pb`, in pipeline order, and compares.
+  /// A function that puts `buf` back as it is now.
+  private func snapshot<T>(_ buf: Shared<T>) -> () -> Void {
+    let saved = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
+    saved.update(from: buf.ptr, count: buf.count)
+    return { buf.ptr.update(from: saved, count: buf.count) }  // kept for the check only
+  }
+
+  /// Runs each stage on both devices over `pb`, in pipeline order, and compares.
   func compareStages(_ pb: CVPixelBuffer) -> [String] {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
     let stride = CVPixelBufferGetBytesPerRow(pb)
-    // segment updates the background model in place, so each run starts from a copy.
-    let saved = Array(UnsafeBufferPointer(start: background.ptr, count: background.count))
-    let restore = { _ = saved.withUnsafeBufferPointer { memcpy(self.background.ptr, $0.baseAddress!, saved.count * 4) } }
+    // segment and smooth update state in place, so each run starts from a copy of it.
+    let restoreBackground = snapshot(background)
+    let restoreHistory = snapshot(history), restoreCrop = snapshot(crop)
+    let restoreSmooth = { restoreHistory(); restoreCrop() }
     return [
       compare("preprocess", small, fills: [-1], { Double($0) }) { runPreprocess(frame, stride, onGPU: $0) },
-      compare("segment mask", mask, fills: [-1], { Double($0) }, reset: restore) { runSegment(onGPU: $0) },
-      compare("segment background", background, fills: [nil], { Double($0) }, reset: restore) { runSegment(onGPU: $0) },
+      compare("segment mask", mask, fills: [-1], { Double($0) }, reset: restoreBackground) { runSegment(onGPU: $0) },
+      compare("segment background", background, fills: [nil], { Double($0) }, reset: restoreBackground) { runSegment(onGPU: $0) },
+      compare("smooth rows", maskScratch, fills: [-1], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
+      compare("smooth history", history, fills: [nil], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
+      // No row statistic is 0x7F7F7F7F, so a skipped one cannot match.
+      compare("smooth stats", stats, fills: [0x7F], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
+      compare("smooth crop", crop, fills: [nil], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
       compare("blur", blurred, fills: [-1], { Double($0) }) { runBlur(onGPU: $0) },
       compare("composite", out, fills: [0x00, 0xFF], { Double($0) }) { runComposite(frame, stride, onGPU: $0) },
     ]
@@ -219,11 +241,10 @@ final class Pipeline {
     precondition(CVPixelBufferGetWidth(pb) == w && CVPixelBufferGetHeight(pb) == h)
     let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
     let stride = CVPixelBufferGetBytesPerRow(pb)
-    let (W, H, SW, SH, F) = (Int64(w), Int64(h), Int64(sw), Int64(sh), Int64(frameIndex))
     let start = DispatchTime.now().uptimeNanoseconds
     timed(0) { runPreprocess(frame, stride, onGPU: onGPU(0)) }
     timed(1) { runSegment(onGPU: onGPU(1)) }
-    timed(2) { vxcam_smooth(history.ptr, softened.ptr, mask.ptr, &crop, SW, SH, W, H, F) }
+    timed(2) { runSmooth(onGPU: onGPU(2)) }
     timed(3) { runBlur(onGPU: onGPU(3)) }
     timed(4) { runComposite(frame, stride, onGPU: onGPU(4)) }
     let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
