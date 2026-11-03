@@ -245,34 +245,71 @@ frame_index : i64) -> void {
 // Stage 4: blur. Blur the small image with two box passes per direction, which
 // is close to a Gaussian. The composite stage scales it up to the frame, so a
 // radius of r small pixels is a radius of r * scale frame pixels.
+//
+// The passes are GPU kernels. `vx_metal_set_enabled(0)` runs the CPU copy of
+// the same kernels on the same memory, so the CPU and the GPU run one source.
+// The images are interleaved RGB: `rows` x `cols` floats, cols = 3 * width.
 //===----------------------------------------------------------------------===//
 
-pub fn vxcam_blur(blurred : *mut f32, scratch : *mut f32, small : *const f32, sw : i64,
-sh : i64, radius : i64) -> void {
-  let n = sw * sh;
-  unsafe {
-    // Split RGB into planes in `blurred`, blur each plane, then interleave again.
-    for i in 0..n {
-      blurred[i] = small[i * 3];
-      blurred[n + i] = small[i * 3 + 1];
-      blurred[2 * n + i] = small[i * 3 + 2];
-    }
-    for c in 0i64..3i64 {
-      let at = c * n;
-      box_pass(scratch, blurred, at, sw, sh, 1, sw, radius);
-      box_pass(blurred, scratch, at, sh, sw, sw, 1, radius);
-      box_pass(scratch, blurred, at, sw, sh, 1, sw, radius);
-      box_pass(blurred, scratch, at, sh, sw, sw, 1, radius);
-    }
-    for i in 0..n {
-      scratch[i * 3] = blurred[i];
-      scratch[i * 3 + 1] = blurred[n + i];
-      scratch[i * 3 + 2] = blurred[2 * n + i];
-    }
-    for i in 0..n * 3 {
-      blurred[i] = scratch[i];
+// One box pass of radius `r` along each row. `n` is 2 * r + 1 as a float.
+fn blur_rows(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
+src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..rows across blocks {
+      for i in 0..cols across lanes(256) {
+        let x = i / 3;
+        let c = i - x * 3;
+        let last = cols / 3 - 1;
+        let mut acc : f32 = 0.0;
+        for d in 0..2 * r + 1 {
+          let mut xx = x + d - r;
+          if xx < 0 {
+            xx = 0;
+          }
+          if xx > last {
+            xx = last;
+          }
+          acc = acc + src[y][xx * 3 + c];
+        }
+        dst[y][i] = acc / n;
+      }
     }
   }
+  return;
+}
+
+// One box pass of radius `r` along each column. `n` is 2 * r + 1 as a float.
+fn blur_cols(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
+src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..cols across blocks {
+      for y in 0..rows across lanes(256) {
+        let mut acc : f32 = 0.0;
+        for d in 0..2 * r + 1 {
+          let mut yy = y + d - r;
+          if yy < 0 {
+            yy = 0;
+          }
+          if yy > rows - 1 {
+            yy = rows - 1;
+          }
+          acc = acc + src[yy][i];
+        }
+        dst[y][i] = acc / n;
+      }
+    }
+  }
+  return;
+}
+
+pub fn vxcam_blur(blurred : &mut Tensor<f32, [?, ?], Memory::HBM>,
+scratch : &mut Tensor<f32, [?, ?], Memory::HBM>, small : &Tensor<f32, [?, ?], Memory::HBM>,
+rows : i32, cols : i32, radius : i32) -> void {
+  let n = (2 * radius + 1) as f32;
+  blur_rows(scratch, small, rows, cols, radius, n);
+  blur_cols(blurred, scratch, rows, cols, radius, n);
+  blur_rows(scratch, blurred, rows, cols, radius, n);
+  blur_cols(blurred, scratch, rows, cols, radius, n);
   return;
 }
 

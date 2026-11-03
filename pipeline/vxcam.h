@@ -20,8 +20,25 @@ void vxcam_segment(float *mask, float *background, const float *small, int64_t s
 void vxcam_smooth(float *history, float *softened, const float *mask, float *crop, int64_t sw,
                   int64_t sh, int64_t w, int64_t h, int64_t frame_index);
 
-void vxcam_blur(float *blurred, float *scratch, const float *small, int64_t sw, int64_t sh,
-                int64_t radius);
+// A tensor parameter of rank 2 is 7 C arguments (docs/lang/abi.md 3.6 and 3.8 in Vx):
+// allocated pointer, aligned pointer, offset, size0, size1, stride0, stride1.
+#define VXCAM_TENSOR2(p, rows, cols) (p), (p), 0, (int64_t)(rows), (int64_t)(cols), (int64_t)(cols), 1
+
+// The blur runs GPU kernels. Images are interleaved RGB f32, rows x cols floats.
+void vxcam_blur(float *, float *, int64_t, int64_t, int64_t, int64_t, int64_t,
+                float *, float *, int64_t, int64_t, int64_t, int64_t, int64_t,
+                const float *, const float *, int64_t, int64_t, int64_t, int64_t, int64_t,
+                int32_t rows, int32_t cols, int32_t radius);
+
+static inline void vxcam_blur_image(float *blurred, float *scratch, const float *small,
+                                    int64_t sw, int64_t sh, int32_t radius) {
+  vxcam_blur(VXCAM_TENSOR2(blurred, sh, 3 * sw), VXCAM_TENSOR2(scratch, sh, 3 * sw),
+             VXCAM_TENSOR2(small, sh, 3 * sw), (int32_t)sh, (int32_t)(3 * sw), radius);
+}
+
+// From the Vx runtime: 1 runs each GPU kernel on the GPU, 0 runs its CPU copy on the
+// same memory. It applies to the calling thread.
+void vx_metal_set_enabled(int on);
 
 void vxcam_composite(uint8_t *out, const uint8_t *frame, const float *blurred, const float *mask,
                      const float *crop, int64_t w, int64_t h, int64_t stride, int64_t out_stride,
