@@ -32,7 +32,7 @@ Each stage gives the same bits on both devices. The numbers say where each stage
   faster on the CPU. `smooth` ends in serial work (reduce the rows to one box, ease the crop
   window), which runs as one GPU thread.
 - The CPU copy of a kernel runs on one thread, so `composite` on the CPU is slower than the
-  8-task version it replaced (2.35 ms).
+  8-task version it replaced (2.35 ms). See [vx-lang/Vx#2649](https://github.com/vx-lang/Vx/issues/2649).
 
 The stand-in segmentation needs a still background and a person who moves, which is what the
 test clip shows. With the camera, step out of view, press `r` so it learns the empty room, and
@@ -99,7 +99,8 @@ What vxc asks of a kernel, as of the `metal-backend` branch:
 - Host code cannot read a tensor in `HBM` without a transfer (E6003), even on unified memory.
   So the end of `smooth`, which is serial, is a kernel that runs as one GPU thread, and
   `composite` reads the crop window as a tensor.
-- The Apple GPU flushes subnormal floats to zero and the CPU copy does not. `smooth` zeroes
-  mask values below 1e-6, which would otherwise decay into subnormals and differ.
+- The Apple GPU flushes subnormal floats to zero and the CPU copy does not
+  ([vx-lang/Vx#2650](https://github.com/vx-lang/Vx/issues/2650)). `smooth` zeroes mask values
+  below 1e-6, which would otherwise decay into subnormals and differ.
 - A byte becomes a float with `as f32`. vxc warns (W1007) and suggests `f32::from`, but it
   refuses a call to `f32::from` inside an `across` loop.
