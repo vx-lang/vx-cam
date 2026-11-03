@@ -12,7 +12,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
   -framework Metal -framework Foundation -framework Accelerate \
   -framework MetalPerformanceShaders -framework CoreML
 
-.PHONY: all run check clean
+.PHONY: all run camera check clean
 
 all: build/vx-cam build/test_clip.mov
 
@@ -21,8 +21,10 @@ build/vxcam.o: pipeline/vxcam.vx | build
 	  -O3 --action emit-obj -o $(CURDIR)/$@ 2>&1 | grep -v "W1029\|dynamic shape\|run-time extent" || true
 	test -f $@
 
-build/vx-cam: shell/main.swift pipeline/vxcam.h build/vxcam.o
-	swiftc -O -import-objc-header pipeline/vxcam.h shell/main.swift build/vxcam.o $(LIBS) -o $@
+# Info.plist goes into the binary, so macOS can ask for the camera with its reason.
+build/vx-cam: shell/main.swift shell/Info.plist pipeline/vxcam.h build/vxcam.o
+	swiftc -O -import-objc-header pipeline/vxcam.h shell/main.swift build/vxcam.o $(LIBS) \
+	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker shell/Info.plist -o $@
 
 build/make_test_clip: tools/make_test_clip.swift | build
 	swiftc -O -suppress-warnings $< -o $@
@@ -32,6 +34,11 @@ build/test_clip.mov: build/make_test_clip
 
 run: all
 	./build/vx-cam build/test_clip.mov
+
+# The default camera. macOS asks once for permission. Step out of view and press r,
+# so the stand-in segmentation learns the empty room, then step back in.
+camera: build/vx-cam
+	./build/vx-cam --camera
 
 # Runs the whole clip without a window, once with every stage on the CPU and once
 # with the GPU stages (preprocess, blur, composite) on the GPU. Prints the stage

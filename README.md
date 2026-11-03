@@ -35,7 +35,8 @@ Each stage gives the same bits on both devices. The numbers say where each stage
   8-task version it replaced (2.35 ms).
 
 The stand-in segmentation needs a still background and a person who moves, which is what the
-test clip shows. A live camera needs the real model (#10).
+test clip shows. With the camera, step out of view, press `r` so it learns the empty room, and
+step back in. A live camera needs the real model (#10) to work anywhere.
 
 ## Build and run
 
@@ -45,13 +46,14 @@ Makefile looks for it in `~/go/Vx-metal-backend`. Set `VX=/path/to/Vx` if it is 
 
 ```sh
 make run      # build, write the test clip, and play it in a window
+make camera   # run on the default camera in a window (macOS asks for permission once)
 make check    # run the whole clip on the CPU, then with the kernels on the GPU; print the
               # stage tables, compare each GPU stage with its CPU copy bit for bit, and
               # write snapshots (output and mask view) to build/snapshots
 ```
 
 Keys in the window: `m` mask view, `b` blur off, `f` auto-framing off, `1`-`5` move a
-stage between the CPU and the GPU, `o` overlay, space pause, `q` quit.
+stage between the CPU and the GPU, `r` learn the background again, `o` overlay, space pause, `q` quit.
 
 ## Layout
 
@@ -59,7 +61,8 @@ stage between the CPU and the GPU, `o` overlay, space pause, `q` quit.
 | --- | --- |
 | `pipeline/vxcam.vx` | The compute: every stage is a `pub fn`, compiled with `vxc --machine fleet/m4-uma.vx` |
 | `pipeline/vxcam.h` | The C interface of those functions, for the shell |
-| `shell/main.swift` | The host shell: video in, window, overlay, keys. No compute |
+| `shell/main.swift` | The host shell: video file or camera in, window, overlay, keys. No compute |
+| `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera |
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
 
 The shell owns every buffer and passes it to Vx as a tensor. It times each stage call for the overlay. "Bytes moved" is 0: no

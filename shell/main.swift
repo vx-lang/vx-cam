@@ -5,6 +5,7 @@
 //
 // Usage:
 //   vx-cam <clip.mov>                      play the clip in a window
+//   vx-cam --camera                        run on the default camera in a window
 //   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table,
 //                                          and write a few frames as PNG to dir
 import AVFoundation
@@ -13,16 +14,32 @@ import CoreVideo
 import ImageIO
 import UniformTypeIdentifiers
 
-// MARK: - Video input
+// MARK: - Input
+
+/// Where frames come from. `start` calls `handler` on `queue` with each BGRA frame.
+protocol FrameSource: AnyObject {
+  var fps: Double { get }
+  func start(on queue: DispatchQueue, _ handler: @escaping (CVPixelBuffer) -> Void)
+}
 
 /// Reads BGRA frames from a movie file, and starts again at the end.
-final class VideoSource {
+final class VideoSource: FrameSource {
   let url: URL
   private var reader: AVAssetReader?
   private var output: AVAssetReaderTrackOutput?
   private(set) var fps: Double = 30
+  private var timer: DispatchSourceTimer?
 
   init(url: URL) { self.url = url; open() }
+
+  /// Plays the clip at its frame rate.
+  func start(on queue: DispatchQueue, _ handler: @escaping (CVPixelBuffer) -> Void) {
+    let t = DispatchSource.makeTimerSource(queue: queue)
+    t.schedule(deadline: .now(), repeating: 1 / fps)
+    t.setEventHandler { [weak self] in if let pb = self?.next() { handler(pb) } }
+    t.resume()
+    timer = t
+  }
 
   private func open() {
     let asset = AVURLAsset(url: url)
@@ -56,6 +73,40 @@ final class VideoSource {
       open()
     }
     return nil
+  }
+}
+
+/// Frames from the default camera: BGRA, 1280 x 720 when the camera offers it.
+final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleBufferDelegate {
+  let fps: Double = 30
+  private let session = AVCaptureSession()
+  private var handler: ((CVPixelBuffer) -> Void)?
+
+  func start(on queue: DispatchQueue, _ handler: @escaping (CVPixelBuffer) -> Void) {
+    self.handler = handler
+    AVCaptureDevice.requestAccess(for: .video) { granted in
+      guard granted, let device = AVCaptureDevice.default(for: .video),
+            let input = try? AVCaptureDeviceInput(device: device) else {
+        print("vx-cam: there is no camera, or no permission to use it")
+        exit(1)
+      }
+      let s = self.session
+      s.beginConfiguration()
+      if s.canSetSessionPreset(.hd1280x720) { s.sessionPreset = .hd1280x720 }
+      s.addInput(input)
+      let out = AVCaptureVideoDataOutput()
+      out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+      out.alwaysDiscardsLateVideoFrames = true
+      out.setSampleBufferDelegate(self, queue: queue)
+      s.addOutput(out)
+      s.commitConfiguration()
+      s.startRunning()
+    }
+  }
+
+  func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer,
+                     from connection: AVCaptureConnection) {
+    if let pb = CMSampleBufferGetImageBuffer(sample) { handler?(pb) }
   }
 }
 
@@ -320,7 +371,7 @@ final class View: NSView {
 }
 
 final class App: NSObject, NSApplicationDelegate {
-  let source: VideoSource
+  let source: FrameSource
   var pipeline: Pipeline!
   let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 540),
                         styleMask: [.titled, .closable, .resizable, .miniaturizable],
@@ -329,12 +380,11 @@ final class App: NSObject, NSApplicationDelegate {
   let video = CALayer()
   let overlay = CATextLayer()
   let queue = DispatchQueue(label: "vx-cam.frames")
-  var timer: DispatchSourceTimer?
   var paused = false
   var showOverlay = true
   var note = ""
 
-  init(source: VideoSource) { self.source = source }
+  init(source: FrameSource) { self.source = source }
 
   func applicationDidFinishLaunching(_ n: Notification) {
     view.wantsLayer = true
@@ -353,23 +403,19 @@ final class App: NSObject, NSApplicationDelegate {
     view.layer!.addSublayer(overlay)
     view.onKey = { [weak self] k in self?.key(k) }
     window.contentView = view
-    window.title = "vx-cam  ·  keys: m mask  b blur  f framing  1-5 device  o overlay  space pause  q quit"
+    window.title = "vx-cam  ·  keys: m mask  b blur  f framing  1-5 device  r relearn  o overlay  space pause  q quit"
     window.center()
     window.makeKeyAndOrderFront(nil)
     window.makeFirstResponder(view)
     NSApp.activate(ignoringOtherApps: true)
 
-    let t = DispatchSource.makeTimerSource(queue: queue)
-    t.schedule(deadline: .now(), repeating: 1 / source.fps)
-    t.setEventHandler { [weak self] in self?.tick() }
-    t.resume()
-    timer = t
+    source.start(on: queue) { [weak self] pb in self?.show(pb) }
   }
 
-  func tick() {
+  func show(_ pb: CVPixelBuffer) {
     if paused { return }
-    guard let pb = source.next() else { return }
-    if pipeline == nil { pipeline = Pipeline(w: CVPixelBufferGetWidth(pb), h: CVPixelBufferGetHeight(pb)) }
+    let (w, h) = (CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb))
+    if pipeline == nil || pipeline.w != w || pipeline.h != h { pipeline = Pipeline(w: w, h: h) }
     pipeline.process(pb)
     let img = pipeline.image()
     let text = pipeline.table(fps: source.fps, note: note)
@@ -389,6 +435,9 @@ final class App: NSObject, NSApplicationDelegate {
       case "m": p.mode = p.mode == 1 ? 0 : 1
       case "b": p.mode = p.mode == 2 ? 0 : 2
       case "f": p.autoFraming.toggle()
+      case "r":  // learn the background again from the next frame
+        p.frameIndex = 0
+        note = "learning the background from this frame"
       case "o": showOverlay.toggle()
       case " ": paused.toggle()
       case "q": DispatchQueue.main.async { NSApp.terminate(nil) }
@@ -404,13 +453,19 @@ final class App: NSObject, NSApplicationDelegate {
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-  print("usage: vx-cam <clip.mov> [--headless N [dir]]")
+  print("usage: vx-cam <clip.mov> [--headless N [dir]]  |  vx-cam --camera")
   exit(2)
 }
-let source = VideoSource(url: URL(fileURLWithPath: args[1]))
-if args.count >= 4 && args[2] == "--headless" {
-  runHeadless(source: source, frames: Int(args[3]) ?? 100, dir: args.count >= 5 ? args[4] : nil)
-  exit(0)
+let source: FrameSource
+if args[1] == "--camera" {
+  source = CameraSource()
+} else {
+  let clip = VideoSource(url: URL(fileURLWithPath: args[1]))
+  if args.count >= 4 && args[2] == "--headless" {
+    runHeadless(source: clip, frames: Int(args[3]) ?? 100, dir: args.count >= 5 ? args[4] : nil)
+    exit(0)
+  }
+  source = clip
 }
 let app = NSApplication.shared
 let delegate = App(source: source)
