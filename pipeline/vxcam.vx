@@ -19,11 +19,109 @@
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
-// How the kernels are written. A clamp of v to [lo, hi] is "lo, or v if v > lo;
-// then hi if that is above hi". A max of a and b is "a if a > b, else b". An
-// abs is "0 - v if v < 0". Each is written out where it is used: vxc's Metal
-// generator does not inline calls to helper functions yet.
+// Helpers for the kernels. A function that a kernel calls runs on the device,
+// so it says `on Topology::Device`, and vxc inlines it into the Metal code. It
+// also says what memory it touches, so the race checker of `across` loops need
+// not read its body: `writes_only()` for none, `reads_only(t)` for reads of t.
 //===----------------------------------------------------------------------===//
+
+fn min_i32_dev(a : i32, b : i32) on Topology::Device -> i32
+ensures writes_only()
+{
+  let mut m = b;
+  if a < b {
+    m = a;
+  }
+  return m;
+}
+
+fn clamp_i32_dev(v : i32, lo : i32, hi : i32) on Topology::Device -> i32
+ensures writes_only()
+{
+  let mut x = v;
+  if x < lo {
+    x = lo;
+  }
+  if x > hi {
+    x = hi;
+  }
+  return x;
+}
+
+fn max_dev(a : f32, b : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  let mut m = b;
+  if a > b {
+    m = a;
+  }
+  return m;
+}
+
+// lo, or v if v is above lo; then hi if that is above hi.
+fn clamp_dev(v : f32, lo : f32, hi : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  let mut x = lo;
+  if v > lo {
+    x = v;
+  }
+  if x > hi {
+    x = hi;
+  }
+  return x;
+}
+
+fn abs_dev(v : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  let mut a = v;
+  if v < 0.0 {
+    a = 0.0 - v;
+  }
+  return a;
+}
+
+// 0 below `lo`, 1 above `hi`, and a smooth ramp between them.
+fn smoothstep_dev(lo : f32, hi : f32, v : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  let t = clamp_dev((v - lo) / (hi - lo), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// A byte as a float. `f32::from` is not allowed in an `across` loop (E6032),
+// so this is a cast, and vxc warns that `f32::from` would say the same (W1007).
+fn byte_dev(v : u8) on Topology::Device -> f32
+ensures writes_only()
+{
+  return v as f32;
+}
+
+// Bilinear mix of four neighbours: a and b on the top row, d and e below.
+fn lerp2(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  let top = a + fx * (b - a);
+  let bottom = d + fx * (e - d);
+  return top + fy * (bottom - top);
+}
+
+// Bilinear sample of `t`: elements x0 and x1 of rows y0 and y1.
+fn sample_u8(t : &Tensor<u8, [?, ?], Memory::HBM>, y0 : i32, y1 : i32, x0 : i32, x1 : i32,
+fx : f32, fy : f32) on Topology::Device -> f32
+ensures reads_only(t)
+{
+  return lerp2(byte_dev(t[y0][x0]), byte_dev(t[y0][x1]), byte_dev(t[y1][x0]),
+  byte_dev(t[y1][x1]), fx, fy);
+}
+
+fn sample_f32(t : &Tensor<f32, [?, ?], Memory::HBM>, y0 : i32, y1 : i32, x0 : i32, x1 : i32,
+fx : f32, fy : f32) on Topology::Device -> f32
+ensures reads_only(t)
+{
+  return lerp2(t[y0][x0], t[y0][x1], t[y1][x0], t[y1][x1], fx, fy);
+}
 
 //===----------------------------------------------------------------------===//
 // Stage 1: preprocess. Average each scale x scale block of the frame into one
@@ -48,9 +146,9 @@ inv : f32) -> void {
           let y = sy * scale + dy;
           for dx in 0..scale {
             let p = (sx * scale + dx) * 4;
-            b = b + frame[y][p] as f32;
-            g = g + frame[y][p + 1] as f32;
-            r = r + frame[y][p + 2] as f32;
+            b = b + byte_dev(frame[y][p]);
+            g = g + byte_dev(frame[y][p + 1]);
+            r = r + byte_dev(frame[y][p + 2]);
           }
         }
         small[sy][sx * 3] = r * inv;
@@ -97,34 +195,8 @@ sw : i32, sh : i32, first : i32) -> void {
           bg = g;
           bb = b;
         }
-        let mut dr = r - br;
-        if dr < 0.0 {
-          dr = 0.0 - dr;
-        }
-        let mut dg = g - bg;
-        if dg < 0.0 {
-          dg = 0.0 - dg;
-        }
-        let mut db = b - bb;
-        if db < 0.0 {
-          db = 0.0 - db;
-        }
-        let mut d = db;
-        if dg > db {
-          d = dg;
-        }
-        if dr > d {
-          d = dr;
-        }
-        let ramp = (d - 0.06) / (0.14 - 0.06);
-        let mut t : f32 = 0.0;
-        if ramp > 0.0 {
-          t = ramp;
-        }
-        if t > 1.0 {
-          t = 1.0;
-        }
-        let m = t * t * (3.0 - 2.0 * t);
+        let d = max_dev(abs_dev(r - br), max_dev(abs_dev(g - bg), abs_dev(b - bb)));
+        let m = smoothstep_dev(0.06, 0.14, d);
         mask[y][x] = m;
         let rate : f32 = 0.02 * (1.0 - m);
         background[y][x * 3] = br + rate * (r - br);
@@ -173,13 +245,7 @@ sw : i32, sh : i32, first : i32) -> void {
       for x in 0..sw across lanes(256) {
         let mut acc : f32 = 0.0;
         for d in 0..5 {
-          let mut xx = x + d - 2;
-          if xx < 0 {
-            xx = 0;
-          }
-          if xx > sw - 1 {
-            xx = sw - 1;
-          }
+          let xx = clamp_i32_dev(x + d - 2, 0, sw - 1);
           let old = history[y][xx];
           let new = mask[y][xx];
           let mut blend = old + 0.5 * (new - old);
@@ -209,14 +275,7 @@ scratch : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
       for x in 0..sw across lanes(256) {
         let mut acc : f32 = 0.0;
         for d in 0..5 {
-          let mut yy = y + d - 2;
-          if yy < 0 {
-            yy = 0;
-          }
-          if yy > sh - 1 {
-            yy = sh - 1;
-          }
-          acc = acc + scratch[yy][x];
+          acc = acc + scratch[clamp_i32_dev(y + d - 2, 0, sh - 1)][x];
         }
         history[y][x] = acc / 5.0;
       }
@@ -303,35 +362,10 @@ first : i32) -> void {
       let bw = ((max_x - min_x + 1) as f32) * sx;
       let bh = ((max_y - min_y + 1) as f32) * sy;
       // th = clamp(max(bh * 1.5, bw * 1.5 * fh / fw), fh * 0.45, fh)
-      let tall = bh * 1.5;
-      let wide = bw * 1.5 * fh / fw;
-      let mut big = wide;
-      if tall > wide {
-        big = tall;
-      }
-      th = fh * 0.45;
-      if big > th {
-        th = big;
-      }
-      if th > fh {
-        th = fh;
-      }
+      th = clamp_dev(max_dev(bh * 1.5, bw * 1.5 * fh / fw), fh * 0.45, fh);
       let tw = th * fw / fh;
-      // tx = clamp(bx0 + bw * 0.5 - tw * 0.5, 0, fw - tw), and ty the same way.
-      let ax = bx0 + bw * 0.5 - tw * 0.5;
-      if ax > 0.0 {
-        tx = ax;
-      }
-      if tx > fw - tw {
-        tx = fw - tw;
-      }
-      let ay = by0 + bh * 0.4 - th * 0.4;
-      if ay > 0.0 {
-        ty = ay;
-      }
-      if ty > fh - th {
-        ty = fh - th;
-      }
+      tx = clamp_dev(bx0 + bw * 0.5 - tw * 0.5, 0.0, fw - tw);
+      ty = clamp_dev(by0 + bh * 0.4 - th * 0.4, 0.0, fh - th);
     }
 
     let mut c0 = crop[0][0];
@@ -345,19 +379,7 @@ first : i32) -> void {
       c3 = fh;
     }
     // Ignore moves under 3% of the frame. Otherwise ease toward the target.
-    let mut dx = tx - c0;
-    if dx < 0.0 {
-      dx = 0.0 - dx;
-    }
-    let mut dy = ty - c1;
-    if dy < 0.0 {
-      dy = 0.0 - dy;
-    }
-    let mut dh = th - c3;
-    if dh < 0.0 {
-      dh = 0.0 - dh;
-    }
-    if dx + dy + dh > 0.03 * fh {
+    if abs_dev(tx - c0) + abs_dev(ty - c1) + abs_dev(th - c3) > 0.03 * fh {
       let k : f32 = 0.06;
       c0 = c0 + k * (tx - c0);
       c1 = c1 + k * (ty - c1);
@@ -408,14 +430,7 @@ src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f3
         let last = cols / 3 - 1;
         let mut acc : f32 = 0.0;
         for d in 0..2 * r + 1 {
-          let mut xx = x + d - r;
-          if xx < 0 {
-            xx = 0;
-          }
-          if xx > last {
-            xx = last;
-          }
-          acc = acc + src[y][xx * 3 + c];
+          acc = acc + src[y][clamp_i32_dev(x + d - r, 0, last) * 3 + c];
         }
         dst[y][i] = acc / n;
       }
@@ -432,14 +447,7 @@ src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f3
       for y in 0..rows across lanes(256) {
         let mut acc : f32 = 0.0;
         for d in 0..2 * r + 1 {
-          let mut yy = y + d - r;
-          if yy < 0 {
-            yy = 0;
-          }
-          if yy > rows - 1 {
-            yy = rows - 1;
-          }
-          acc = acc + src[yy][i];
+          acc = acc + src[clamp_i32_dev(y + d - r, 0, rows - 1)][i];
         }
         dst[y][i] = acc / n;
       }
@@ -473,8 +481,7 @@ rows : i32, cols : i32, radius : i32) -> void {
 // `inv_scale` is 1 / scale, from frame pixels to small pixels.
 //
 // Each lane writes its pixel as one u32 (B, G, R, A from the low byte up), so
-// the race checker sees that no two lanes write the same element. Each bilinear
-// mix is a + fx * (b - a) along the row, then the same down the column.
+// the race checker sees that no two lanes write the same element.
 fn composite_kernel(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
 mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::HBM>,
@@ -488,83 +495,29 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
         let kx = crop[0][2] / (w as f32);
         let ky = crop[0][3] / (h as f32);
         // Where this pixel comes from: sy, sx in the frame, v, u in the small images.
-        let ty = y0 + ((oy as f32) + 0.5) * ky - 0.5;
-        let mut sy : f32 = 0.0;
-        if ty > 0.0 {
-          sy = ty;
-        }
-        if sy > (h - 1) as f32 {
-          sy = (h - 1) as f32;
-        }
+        let sy = clamp_dev(y0 + ((oy as f32) + 0.5) * ky - 0.5, 0.0, (h - 1) as f32);
         let iy0 = sy as i32;
-        let mut iy1 = iy0 + 1;
-        if iy1 > h - 1 {
-          iy1 = h - 1;
-        }
+        let iy1 = min_i32_dev(iy0 + 1, h - 1);
         let fy = sy - iy0 as f32;
-        let tv = (sy + 0.5) * inv_scale - 0.5;
-        let mut v : f32 = 0.0;
-        if tv > 0.0 {
-          v = tv;
-        }
-        if v > (sh - 1) as f32 {
-          v = (sh - 1) as f32;
-        }
+        let v = clamp_dev((sy + 0.5) * inv_scale - 0.5, 0.0, (sh - 1) as f32);
         let vy0 = v as i32;
-        let mut vy1 = vy0 + 1;
-        if vy1 > sh - 1 {
-          vy1 = sh - 1;
-        }
+        let vy1 = min_i32_dev(vy0 + 1, sh - 1);
         let gy = v - vy0 as f32;
-        let tx = x0 + ((ox as f32) + 0.5) * kx - 0.5;
-        let mut sx : f32 = 0.0;
-        if tx > 0.0 {
-          sx = tx;
-        }
-        if sx > (w - 1) as f32 {
-          sx = (w - 1) as f32;
-        }
+        let sx = clamp_dev(x0 + ((ox as f32) + 0.5) * kx - 0.5, 0.0, (w - 1) as f32);
         let ix0 = sx as i32;
-        let mut ix1 = ix0 + 1;
-        if ix1 > w - 1 {
-          ix1 = w - 1;
-        }
+        let ix1 = min_i32_dev(ix0 + 1, w - 1);
         let fx = sx - ix0 as f32;
-        let tu = (sx + 0.5) * inv_scale - 0.5;
-        let mut u : f32 = 0.0;
-        if tu > 0.0 {
-          u = tu;
-        }
-        if u > (sw - 1) as f32 {
-          u = (sw - 1) as f32;
-        }
+        let u = clamp_dev((sx + 0.5) * inv_scale - 0.5, 0.0, (sw - 1) as f32);
         let ux0 = u as i32;
-        let mut ux1 = ux0 + 1;
-        if ux1 > sw - 1 {
-          ux1 = sw - 1;
-        }
+        let ux1 = min_i32_dev(ux0 + 1, sw - 1);
         let gx = u - ux0 as f32;
-        let mt = mask[vy0][ux0] + gx * (mask[vy0][ux1] - mask[vy0][ux0]);
-        let mb = mask[vy1][ux0] + gx * (mask[vy1][ux1] - mask[vy1][ux0]);
-        let m = mt + gy * (mb - mt);
+        let m = sample_f32(mask, vy0, vy1, ux0, ux1, gx, gy);
         let mut pixel : u32 = 4278190080; // A = 255
         for c in 0..3 {
           // BGRA in the frame and in `out`, RGB in `blurred`.
-          let a00 = frame[iy0][ix0 * 4 + c] as f32;
-          let a01 = frame[iy0][ix1 * 4 + c] as f32;
-          let a10 = frame[iy1][ix0 * 4 + c] as f32;
-          let a11 = frame[iy1][ix1 * 4 + c] as f32;
-          let st = a00 + fx * (a01 - a00);
-          let sb = a10 + fx * (a11 - a10);
-          let sharp = st + fy * (sb - st);
+          let sharp = sample_u8(frame, iy0, iy1, ix0 * 4 + c, ix1 * 4 + c, fx, fy);
           let k = 2 - c;
-          let b00 = blurred[vy0][ux0 * 3 + k];
-          let b01 = blurred[vy0][ux1 * 3 + k];
-          let b10 = blurred[vy1][ux0 * 3 + k];
-          let b11 = blurred[vy1][ux1 * 3 + k];
-          let bt = b00 + gx * (b01 - b00);
-          let bb = b10 + gx * (b11 - b10);
-          let soft = 255.0 * (bt + gy * (bb - bt));
+          let soft = 255.0 * sample_f32(blurred, vy0, vy1, ux0 * 3 + k, ux1 * 3 + k, gx, gy);
           let mut value = sharp;
           if mode == 0 {
             value = soft + m * (sharp - soft);
@@ -572,14 +525,7 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
           if mode == 1 {
             value = 0.25 * sharp + 0.75 * 255.0 * m;
           }
-          let mut q : f32 = 0.0;
-          if value > 0.0 {
-            q = value;
-          }
-          if q > 255.0 {
-            q = 255.0;
-          }
-          pixel = pixel | (((q + 0.5) as u32) << ((8 * c) as u32));
+          pixel = pixel | (((clamp_dev(value, 0.0, 255.0) + 0.5) as u32) << ((8 * c) as u32));
         }
         out[oy][ox] = pixel;
       }

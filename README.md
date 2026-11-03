@@ -93,7 +93,9 @@ What vxc asks of a kernel, as of the `metal-backend` branch:
 - `composite` writes each pixel as one `u32` into an `[h, w]` tensor. vxc proves that no two
   lanes write the same element, and it cannot prove that for `out[y][x * 4 + c]` with `c` from
   a loop.
-- The kernels have no helper functions, because the Metal generator does not inline calls yet.
+- A helper function that a kernel calls says `on Topology::Device` and what memory it
+  touches (`ensures writes_only()` or `ensures reads_only(t)`). vxc inlines it into the Metal
+  code.
 - Host code cannot read a tensor in `HBM` without a transfer (E6003), even on unified memory.
   So the end of `smooth`, which is serial, is a kernel that runs as one GPU thread, and
   `composite` reads the crop window as a tensor.
