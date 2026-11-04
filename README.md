@@ -85,8 +85,9 @@ pages to the GPU as they are, so the handoff between a CPU stage and a GPU stage
 nothing. The only cost is the wait for the GPU, because each launch waits for it to finish.
 
 A tensor crosses into Vx as 7 C arguments per rank-2 tensor (`VXCAM_TENSOR2` in
-`pipeline/vxcam.h`). Vx reads row y of a `[?, ?]` tensor at y times its row length and
-ignores the row stride, so a camera frame with padded rows goes in as `[height, bytesPerRow]`.
+`pipeline/vxcam.h`). Vx needs a packed tensor, one whose row stride is its row length, and
+stops the program when a `pub fn` gets any other. So a camera frame with padded rows goes in
+as `[height, bytesPerRow]`, padding included.
 
 What vxc asks of a kernel, as of the `metal-backend` branch:
 

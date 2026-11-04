@@ -12,8 +12,9 @@ extern "C" {
 #endif
 
 // A tensor parameter of rank 2 is 7 C arguments (docs/lang/abi.md 3.6 and 3.8 in Vx):
-// allocated pointer, aligned pointer, offset, size0, size1, stride0, stride1. Vx reads
-// row y at y * size1, so a frame with padded rows is [height, bytes per row].
+// allocated pointer, aligned pointer, offset, size0, size1, stride0, stride1. Vx needs a
+// packed tensor (stride0 = size1, stride1 = 1) and stops the program on any other, so a
+// frame with padded rows is [height, bytes per row].
 #define VXCAM_TENSOR2(p, rows, cols) (p), (p), 0, (int64_t)(rows), (int64_t)(cols), (int64_t)(cols), 1
 #define VXCAM_TENSOR2_ARGS(T) T *, T *, int64_t, int64_t, int64_t, int64_t, int64_t
 

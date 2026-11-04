@@ -128,8 +128,8 @@ ensures reads_only(t)
 // pixel of `small`, and convert BGRA8 to RGB f32.
 //
 // A GPU kernel, one lane per pixel of `small`. The frame is `[h, stride]` bytes:
-// Vx ignores the row stride of a tensor from C, so the padding at the end of
-// each row is part of the row.
+// Vx needs a packed tensor from C, so the padding at the end of each row is part
+// of the row.
 //===----------------------------------------------------------------------===//
 
 // `inv` is 1 / (scale * scale * 255).
