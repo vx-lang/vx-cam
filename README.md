@@ -54,8 +54,8 @@ Needs macOS on Apple Silicon, the Swift toolchain (Command Line Tools), and a Vx
 `vxc` built that has the Metal backend. Until it merges, that is a branch with the Apple GPU PRs
 ([vx-lang/Vx#2708](https://github.com/vx-lang/Vx/pull/2708) to
 [#2711](https://github.com/vx-lang/Vx/pull/2711)) and the transfer PRs
-([#2713](https://github.com/vx-lang/Vx/pull/2713) to
-[#2715](https://github.com/vx-lang/Vx/pull/2715)) on it. The Makefile looks for it in
+([#2733](https://github.com/vx-lang/Vx/pull/2733) to
+[#2735](https://github.com/vx-lang/Vx/pull/2735)) on it. The Makefile looks for it in
 `~/go/Vx-metal-backend`. Set `VX=/path/to/Vx` if it is elsewhere.
 
 ```sh
