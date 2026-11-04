@@ -51,11 +51,13 @@ step back in. A live camera needs the real model ([#3](https://github.com/vx-lan
 ## Build and run
 
 Needs macOS on Apple Silicon, the Swift toolchain (Command Line Tools), and a Vx checkout with
-`vxc` built that has the Metal backend. Until it merges, that is a branch with the Apple GPU PRs
-([vx-lang/Vx#2708](https://github.com/vx-lang/Vx/pull/2708) to
-[#2711](https://github.com/vx-lang/Vx/pull/2711)) and the transfer PRs
+`vxc` built that has the Metal backend. Until it merges, that is a branch with these PRs on it:
+the Apple GPU stack ([vx-lang/Vx#2708](https://github.com/vx-lang/Vx/pull/2708) to
+[#2711](https://github.com/vx-lang/Vx/pull/2711), then
+[#2732](https://github.com/vx-lang/Vx/pull/2732)), the transfer stack
 ([#2733](https://github.com/vx-lang/Vx/pull/2733) to
-[#2735](https://github.com/vx-lang/Vx/pull/2735)) on it. The Makefile looks for it in
+[#2735](https://github.com/vx-lang/Vx/pull/2735)), and `on Topology::Any`
+([#2731](https://github.com/vx-lang/Vx/pull/2731)). The Makefile looks for it in
 `~/go/Vx-metal-backend`. Set `VX=/path/to/Vx` if it is elsewhere.
 
 ```sh
@@ -109,9 +111,9 @@ What vxc asks of the code, with those PRs:
 - vxc proves that no two lanes of a kernel write the same element. `composite` writes the
   four bytes of its pixel at `x * 4 + c`, and vxc sees that lane `x` owns those bytes.
 - A helper function says where it runs and what memory it touches (`ensures writes_only()`
-  or `ensures reads_only(t)`). vxc inlines it into the Metal code. The scalar helpers are
-  generic over the topology, `fn f<D : Topology>(..) on Topology::D`, so the kernels and the
-  host code in `smooth` call the same ones. The samplers say `on Topology::Device`. The
+  or `ensures reads_only(t)`). vxc inlines it into the Metal code. The scalar helpers say
+  `on Topology::Any`: they run where they are called, so the kernels and the host code in
+  `smooth` call the same ones. The samplers say `on Topology::Device`. The
   conversions in `core::convert`, such as `f32::from` for a byte, work on either side.
 - Host code reads a tensor in `HBM` through `transfer(t, Memory::CPU_DRAM)`, which waits for
   the GPU and gives an owned copy in host memory. Reading it without a transfer is an error
@@ -119,6 +121,6 @@ What vxc asks of the code, with those PRs:
   machine. `fleet/m4-uma.vx` says `transfer Memory::HBM -> Memory::CPU_DRAM : shared`, so
   when a function only reads the copy, vxc drops it and reads the GPU's memory in place after
   the wait. If the function writes the copy or lets it escape, vxc copies and warns.
-- The Apple GPU flushes subnormal floats to zero and the CPU copy does not
-  ([vx-lang/Vx#2650](https://github.com/vx-lang/Vx/issues/2650)). `smooth` zeroes mask values
-  below 1e-6, which would otherwise decay into subnormals and differ.
+- The Apple GPU flushes subnormal floats to zero, and so does the CPU copy of an Apple GPU
+  kernel ([vx-lang/Vx#2650](https://github.com/vx-lang/Vx/issues/2650)). So where the person
+  has left, the mask decays to zero the same way on both devices.

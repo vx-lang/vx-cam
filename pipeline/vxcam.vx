@@ -22,15 +22,15 @@
 import core::convert;
 
 //===----------------------------------------------------------------------===//
-// Helpers. A function says where it runs. The scalar helpers are generic over
-// the topology (`<D : Topology> ... on Topology::D`), so kernels and host code
+// Helpers. A function says where it runs. The scalar helpers say
+// `on Topology::Any`: they run where they are called, so kernels and host code
 // call the same ones. The samplers read GPU tensors, so they say
 // `on Topology::Device`. vxc inlines a helper into the Metal code. Each also says
 // what memory it touches, so the race checker of `across` loops need not read
 // its body: `writes_only()` for none, `reads_only(t)` for reads of t.
 //===----------------------------------------------------------------------===//
 
-fn min_i32<D : Topology>(a : i32, b : i32) on Topology::D -> i32
+fn min_i32(a : i32, b : i32) on Topology::Any -> i32
 ensures writes_only()
 {
   let mut m = b;
@@ -40,7 +40,7 @@ ensures writes_only()
   return m;
 }
 
-fn clamp_i32<D : Topology>(v : i32, lo : i32, hi : i32) on Topology::D -> i32
+fn clamp_i32(v : i32, lo : i32, hi : i32) on Topology::Any -> i32
 ensures writes_only()
 {
   let mut x = v;
@@ -53,7 +53,7 @@ ensures writes_only()
   return x;
 }
 
-fn max_f32<D : Topology>(a : f32, b : f32) on Topology::D -> f32
+fn max_f32(a : f32, b : f32) on Topology::Any -> f32
 ensures writes_only()
 {
   let mut m = b;
@@ -64,7 +64,7 @@ ensures writes_only()
 }
 
 // lo, or v if v is above lo; then hi if that is above hi.
-fn clamp_f32<D : Topology>(v : f32, lo : f32, hi : f32) on Topology::D -> f32
+fn clamp_f32(v : f32, lo : f32, hi : f32) on Topology::Any -> f32
 ensures writes_only()
 {
   let mut x = lo;
@@ -77,7 +77,7 @@ ensures writes_only()
   return x;
 }
 
-fn abs_f32<D : Topology>(v : f32) on Topology::D -> f32
+fn abs_f32(v : f32) on Topology::Any -> f32
 ensures writes_only()
 {
   let mut a = v;
@@ -88,7 +88,7 @@ ensures writes_only()
 }
 
 // 0 below `lo`, 1 above `hi`, and a smooth ramp between them.
-fn smoothstep<D : Topology>(lo : f32, hi : f32, v : f32) on Topology::D -> f32
+fn smoothstep(lo : f32, hi : f32, v : f32) on Topology::Any -> f32
 ensures writes_only()
 {
   let t = clamp_f32((v - lo) / (hi - lo), 0.0, 1.0);
@@ -96,8 +96,7 @@ ensures writes_only()
 }
 
 // Bilinear mix of four neighbours: a and b on the top row, d and e below.
-fn lerp2<D : Topology>(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32)
-on Topology::D -> f32
+fn lerp2(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32) on Topology::Any -> f32
 ensures writes_only()
 {
   let top = a + fx * (b - a);
@@ -248,12 +247,6 @@ sw : i32, sh : i32, first : i32) -> void {
           let mut blend = old + 0.5 * (new - old);
           if first == 1 {
             blend = new;
-          }
-          // Where the person has left, the blend halves each frame and would
-          // reach the subnormal floats. The GPU flushes those to zero and the
-          // CPU does not, so the two devices would differ. Zero it well before.
-          if blend < 0.000001 {
-            blend = 0.0;
           }
           acc = acc + blend;
         }
