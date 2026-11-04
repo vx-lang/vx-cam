@@ -51,8 +51,12 @@ step back in. A live camera needs the real model ([#3](https://github.com/vx-lan
 ## Build and run
 
 Needs macOS on Apple Silicon, the Swift toolchain (Command Line Tools), and a Vx checkout with
-`vxc` built that has the Metal backend (branch `metal-backend` until it is merged). The
-Makefile looks for it in `~/go/Vx-metal-backend`. Set `VX=/path/to/Vx` if it is elsewhere.
+`vxc` built that has the Metal backend. Until it merges, that is a branch with the Apple GPU PRs
+([vx-lang/Vx#2708](https://github.com/vx-lang/Vx/pull/2708) to
+[#2711](https://github.com/vx-lang/Vx/pull/2711)) and the transfer PRs
+([#2713](https://github.com/vx-lang/Vx/pull/2713) to
+[#2715](https://github.com/vx-lang/Vx/pull/2715)) on it. The Makefile looks for it in
+`~/go/Vx-metal-backend`. Set `VX=/path/to/Vx` if it is elsewhere.
 
 ```sh
 make run      # build, write the test clip, and play it in a window
@@ -100,7 +104,7 @@ A tensor crosses into Vx as 7 C arguments per rank-2 tensor (`VXCAM_TENSOR2` in
 stops the program when a `pub fn` gets any other. So a camera frame with padded rows goes in
 as `[height, bytesPerRow]`, padding included.
 
-What vxc asks of the code, as of the `metal-backend` branch:
+What vxc asks of the code, with those PRs:
 
 - vxc proves that no two lanes of a kernel write the same element. `composite` writes the
   four bytes of its pixel at `x * 4 + c`, and vxc sees that lane `x` owns those bytes.
