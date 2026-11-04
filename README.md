@@ -51,11 +51,9 @@ step back in. A live camera needs the real model ([#3](https://github.com/vx-lan
 ## Build and run
 
 Needs macOS on Apple Silicon, the Swift toolchain (Command Line Tools), and a Vx checkout with
-`vxc` built that has the Metal backend. Until it merges, that is a branch with the Apple GPU PRs
-([vx-lang/Vx#2708](https://github.com/vx-lang/Vx/pull/2708) to
-[#2711](https://github.com/vx-lang/Vx/pull/2711)) and the transfer PRs
-([#2733](https://github.com/vx-lang/Vx/pull/2733) to
-[#2735](https://github.com/vx-lang/Vx/pull/2735)) on it. The Makefile looks for it in
+`vxc` built that has the Metal backend. Until it merges, that is Vx main with the Apple GPU PRs
+([vx-lang/Vx#2747](https://github.com/vx-lang/Vx/pull/2747) to
+[#2750](https://github.com/vx-lang/Vx/pull/2750)) on it. The Makefile looks for it in
 `~/go/Vx-metal-backend`. Set `VX=/path/to/Vx` if it is elsewhere.
 
 ```sh
