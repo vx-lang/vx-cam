@@ -18,21 +18,30 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `blur` | Separable box blur (two passes, close to a Gaussian) at 1/4 size | #9 |
 | `composite` | Crop and zoom, then mix sharp person and blurred background | #9 |
 
-On the M4, over the 360-frame test clip (`make check`):
+On the M4 (10 cores), over the 360-frame test clip, the middle run of three:
 
 | | preprocess | segment | smooth | blur | composite | whole frame |
 | --- | --- | --- | --- | --- | --- | --- |
-| all on the CPU | 0.58 ms | 0.07 ms | 0.23 ms | 2.52 ms | 10.62 ms | 14.03 ms |
-| all on the GPU | 0.34 ms | 0.26 ms | 0.86 ms | 1.04 ms | 0.47 ms | 2.98 ms |
+| all on the CPU | 0.17 ms | 0.06 ms | 0.19 ms | 0.83 ms | 2.29 ms | 3.53 ms |
+| all on the GPU | 0.32 ms | 0.26 ms | 0.91 ms | 1.07 ms | 0.48 ms | 3.04 ms |
+| `VXCAM_GPU=blur,composite` | 0.22 ms | 0.05 ms | 0.19 ms | 1.11 ms | 0.50 ms | 2.08 ms |
 
 Each stage gives the same bits on both devices. The numbers say where each stage belongs:
 
-- `blur` and `composite` touch every pixel and belong on the GPU.
-- `segment` and `smooth` are small. A launch waits for the GPU, about 0.1 ms each, so they are
-  faster on the CPU. `smooth` ends in serial work (reduce the rows to one box, ease the crop
-  window), which runs as one GPU thread.
-- The CPU copy of a kernel runs on one thread, so `composite` on the CPU is slower than the
-  8-task version it replaced (2.35 ms). See [vx-lang/Vx#2649](https://github.com/vx-lang/Vx/issues/2649).
+- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.48 ms,
+  against 2.29 ms on all ten cores.
+- The other stages work at 1/4 size. Each GPU launch waits for the GPU to finish, so a small
+  stage costs more on the GPU than on the CPU. `smooth` also ends in serial work (reduce the
+  rows to one box, ease the crop window), which runs as one GPU thread.
+- `blur` is close. On the CPU it is faster, but then `composite` is the only GPU launch of the
+  frame and takes 0.78 ms rather than 0.50 ms. Moving both to the GPU gives the fastest
+  frame, by a little.
+- The CPU copy of a kernel shares its blocks among the cores
+  ([vx-lang/Vx#2649](https://github.com/vx-lang/Vx/issues/2649)). Before that it ran on one
+  thread, and `composite` on the CPU took 10.6 ms.
+- On an idle machine, some runs with stages on the GPU take about three times as long in every
+  GPU stage (about 9 ms for all on the GPU). The table shows the usual runs. The cause is not
+  known yet.
 
 The stand-in segmentation needs a still background and a person who moves, which is what the
 test clip shows. With the camera, step out of view, press `r` so it learns the empty room, and
