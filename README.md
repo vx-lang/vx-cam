@@ -7,7 +7,7 @@ auto-framing, with each stage placed on the CPU or the GPU of a MacBook. The pla
 ## Status
 
 All five stages are Vx, and every stage is GPU kernels that run on the Apple GPU or, from the
-same source, on the CPU. Press `1`-`5` to move a stage, or start with `VXCAM_GPU=all` (or names
+same source, on the CPU. The serial end of `smooth` is host code. Press `1`-`5` to move a stage, or start with `VXCAM_GPU=all` (or names
 separated by commas, such as `VXCAM_GPU=blur,composite`).
 
 | Stage | What it does | Proposal |
@@ -22,17 +22,17 @@ On the M4 (10 cores), over the 360-frame test clip, the middle run of three:
 
 | | preprocess | segment | smooth | blur | composite | whole frame |
 | --- | --- | --- | --- | --- | --- | --- |
-| all on the CPU | 0.17 ms | 0.06 ms | 0.19 ms | 0.83 ms | 2.29 ms | 3.53 ms |
-| all on the GPU | 0.32 ms | 0.26 ms | 0.91 ms | 1.07 ms | 0.48 ms | 3.04 ms |
-| `VXCAM_GPU=blur,composite` | 0.22 ms | 0.05 ms | 0.19 ms | 1.11 ms | 0.50 ms | 2.08 ms |
+| all on the CPU | 0.18 ms | 0.06 ms | 0.17 ms | 0.91 ms | 2.22 ms | 3.47 ms |
+| all on the GPU | 0.33 ms | 0.26 ms | 0.65 ms | 1.07 ms | 0.45 ms | 2.76 ms |
+| `VXCAM_GPU=blur,composite` | 0.24 ms | 0.06 ms | 0.17 ms | 1.06 ms | 0.45 ms | 1.98 ms |
 
 Each stage gives the same bits on both devices. The numbers say where each stage belongs:
 
-- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.48 ms,
-  against 2.29 ms on all ten cores.
+- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.45 ms,
+  against 2.22 ms on all ten cores.
 - The other stages work at 1/4 size. Each GPU launch waits for the GPU to finish, so a small
-  stage costs more on the GPU than on the CPU. `smooth` also ends in serial work (reduce the
-  rows to one box, ease the crop window), which runs as one GPU thread.
+  stage costs more on the GPU than on the CPU. `smooth` ends in serial work (reduce the rows
+  to one box, ease the crop window), which is host code on either device.
 - `blur` is close. On the CPU it is faster, but then `composite` is the only GPU launch of the
   frame and takes 0.78 ms rather than 0.50 ms. Moving both to the GPU gives the fastest
   frame, by a little.
@@ -74,8 +74,10 @@ stage between the CPU and the GPU, `r` learn the background again, `o` overlay, 
 | `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera |
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
 
-The shell owns every buffer and passes it to Vx as a tensor. It times each stage call for the overlay. "Bytes moved" is 0: no
-stage copies a buffer, on either device.
+The shell owns every buffer and passes it to Vx as a tensor. It times each stage call for the
+overlay. "Bytes moved" counts the buffers the shell copies, which is none. Inside `smooth`, Vx
+copies the 540 row stats (2 KB) to host memory each frame, until vxc removes that copy on
+unified memory.
 
 The shell links two libraries from the Vx build: `libnpu_dispatch.a`, which runs the GPU
 kernels through Metal, and `libvx_std_core.a`, the Vx runtime.
@@ -105,9 +107,12 @@ What vxc asks of a kernel, as of the `metal-backend` branch:
 - A helper function that a kernel calls says `on Topology::Device` and what memory it
   touches (`ensures writes_only()` or `ensures reads_only(t)`). vxc inlines it into the Metal
   code. The conversions in `core::convert`, such as `f32::from` for a byte, say this already.
-- Host code cannot read a tensor in `HBM` without a transfer (E6003), even on unified memory.
-  So the end of `smooth`, which is serial, is a kernel that runs as one GPU thread, and
-  `composite` reads the crop window as a tensor.
+- Host code reads a tensor in `HBM` through `transfer(t, Memory::CPU_DRAM)`, which waits for
+  the GPU and gives an owned copy in host memory. Reading it without a transfer is an error
+  (E6003). The end of `smooth` reads its row stats this way. The type is a copy on every
+  machine. On unified memory vxc is to drop the copy as an optimization.
+- Host code cannot call a function that is `on Topology::Device` (E6001), so the end of
+  `smooth` has host copies of `clamp`, `max` and `abs`.
 - The Apple GPU flushes subnormal floats to zero and the CPU copy does not
   ([vx-lang/Vx#2650](https://github.com/vx-lang/Vx/issues/2650)). `smooth` zeroes mask values
   below 1e-6, which would otherwise decay into subnormals and differ.
