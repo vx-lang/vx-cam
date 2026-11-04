@@ -91,17 +91,14 @@ as `[height, bytesPerRow]`, padding included.
 
 What vxc asks of a kernel, as of the `metal-backend` branch:
 
-- `composite` writes each pixel as one `u32` into an `[h, w]` tensor. vxc proves that no two
-  lanes write the same element, and it cannot prove that for `out[y][x * 4 + c]` with `c` from
-  a loop.
+- vxc proves that no two lanes of a kernel write the same element. `composite` writes the
+  four bytes of its pixel at `x * 4 + c`, and vxc sees that lane `x` owns those bytes.
 - A helper function that a kernel calls says `on Topology::Device` and what memory it
   touches (`ensures writes_only()` or `ensures reads_only(t)`). vxc inlines it into the Metal
-  code.
+  code. The conversions in `core::convert`, such as `f32::from` for a byte, say this already.
 - Host code cannot read a tensor in `HBM` without a transfer (E6003), even on unified memory.
   So the end of `smooth`, which is serial, is a kernel that runs as one GPU thread, and
   `composite` reads the crop window as a tensor.
 - The Apple GPU flushes subnormal floats to zero and the CPU copy does not
   ([vx-lang/Vx#2650](https://github.com/vx-lang/Vx/issues/2650)). `smooth` zeroes mask values
   below 1e-6, which would otherwise decay into subnormals and differ.
-- A byte becomes a float with `as f32`. vxc warns (W1007) and suggests `f32::from`, but it
-  refuses a call to `f32::from` inside an `across` loop.

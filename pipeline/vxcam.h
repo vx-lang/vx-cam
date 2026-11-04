@@ -31,7 +31,7 @@ void vx_metal_set_enabled(int on);
 //   history  f32 like mask; smooth keeps it from frame to frame, and composite reads it
 //   stats    int32, sh rows of 3: each row's part of the person's bounding box
 //   crop     4 floats: x0, y0, width and height of the output window
-//   out      BGRA8, h rows of w pixels; the kernel writes each pixel as one uint32_t
+//   out      BGRA8, h rows of w pixels
 
 void vxcam_preprocess(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(const uint8_t),
                       int32_t sw, int32_t sh, int32_t scale);
@@ -75,7 +75,7 @@ static inline void vxcam_blur_image(float *blurred, float *scratch, const float 
              VXCAM_TENSOR2(small, sh, 3 * sw), (int32_t)sh, (int32_t)(3 * sw), radius);
 }
 
-void vxcam_composite(VXCAM_TENSOR2_ARGS(uint32_t), VXCAM_TENSOR2_ARGS(const uint8_t),
+void vxcam_composite(VXCAM_TENSOR2_ARGS(uint8_t), VXCAM_TENSOR2_ARGS(const uint8_t),
                      VXCAM_TENSOR2_ARGS(const float), VXCAM_TENSOR2_ARGS(const float),
                      VXCAM_TENSOR2_ARGS(const float), int32_t w, int32_t h, int32_t scale,
                      int32_t mode);
@@ -85,7 +85,7 @@ static inline void vxcam_composite_frame(uint8_t *out, const uint8_t *frame,
                                          const float *crop, int64_t w, int64_t h,
                                          int64_t stride, int32_t scale, int32_t mode) {
   int64_t sw = w / scale, sh = h / scale;
-  vxcam_composite(VXCAM_TENSOR2((uint32_t *)out, h, w), VXCAM_TENSOR2(frame, h, stride),
+  vxcam_composite(VXCAM_TENSOR2(out, h, 4 * w), VXCAM_TENSOR2(frame, h, stride),
                   VXCAM_TENSOR2(blurred, sh, 3 * sw), VXCAM_TENSOR2(mask, sh, sw),
                   VXCAM_TENSOR2(crop, 1, 4), (int32_t)w, (int32_t)h, scale, mode);
 }

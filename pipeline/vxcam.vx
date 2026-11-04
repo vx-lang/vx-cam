@@ -18,6 +18,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+import core::convert;
+
 //===----------------------------------------------------------------------===//
 // Helpers for the kernels. A function that a kernel calls runs on the device,
 // so it says `on Topology::Device`, and vxc inlines it into the Metal code. It
@@ -90,14 +92,6 @@ ensures writes_only()
   return t * t * (3.0 - 2.0 * t);
 }
 
-// A byte as a float. `f32::from` is not allowed in an `across` loop (E6032),
-// so this is a cast, and vxc warns that `f32::from` would say the same (W1007).
-fn byte_dev(v : u8) on Topology::Device -> f32
-ensures writes_only()
-{
-  return v as f32;
-}
-
 // Bilinear mix of four neighbours: a and b on the top row, d and e below.
 fn lerp2(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32) on Topology::Device -> f32
 ensures writes_only()
@@ -112,8 +106,8 @@ fn sample_u8(t : &Tensor<u8, [?, ?], Memory::HBM>, y0 : i32, y1 : i32, x0 : i32,
 fx : f32, fy : f32) on Topology::Device -> f32
 ensures reads_only(t)
 {
-  return lerp2(byte_dev(t[y0][x0]), byte_dev(t[y0][x1]), byte_dev(t[y1][x0]),
-  byte_dev(t[y1][x1]), fx, fy);
+  return lerp2(f32::from(t[y0][x0]), f32::from(t[y0][x1]), f32::from(t[y1][x0]),
+  f32::from(t[y1][x1]), fx, fy);
 }
 
 fn sample_f32(t : &Tensor<f32, [?, ?], Memory::HBM>, y0 : i32, y1 : i32, x0 : i32, x1 : i32,
@@ -146,9 +140,9 @@ inv : f32) -> void {
           let y = sy * scale + dy;
           for dx in 0..scale {
             let p = (sx * scale + dx) * 4;
-            b = b + byte_dev(frame[y][p]);
-            g = g + byte_dev(frame[y][p + 1]);
-            r = r + byte_dev(frame[y][p + 2]);
+            b = b + f32::from(frame[y][p]);
+            g = g + f32::from(frame[y][p + 1]);
+            r = r + f32::from(frame[y][p + 2]);
           }
         }
         small[sy][sx * 3] = r * inv;
@@ -473,16 +467,13 @@ rows : i32, cols : i32, radius : i32) -> void {
 // `mode` 0 is the normal output, 1 shows the mask, 2 turns the blur off.
 //
 // A GPU kernel, one lane per output pixel. `frame` is `[h, stride]` bytes as in
-// preprocess, `out` is `[h, w]` BGRA pixels, `blurred` is `[sh, 3 * sw]` and
+// preprocess, `out` is `[h, 4 * w]` BGRA bytes, `blurred` is `[sh, 3 * sw]` and
 // `mask` is `[sh, sw]`.
 //===----------------------------------------------------------------------===//
 
 // `crop` is `[1, 4]`: x0, y0, width and height of the window, in frame pixels.
 // `inv_scale` is 1 / scale, from frame pixels to small pixels.
-//
-// Each lane writes its pixel as one u32 (B, G, R, A from the low byte up), so
-// the race checker sees that no two lanes write the same element.
-fn composite_kernel(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
+fn composite_kernel(out : &mut Tensor<u8, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
 mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::HBM>,
 inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
@@ -512,7 +503,6 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
         let ux1 = min_i32_dev(ux0 + 1, sw - 1);
         let gx = u - ux0 as f32;
         let m = sample_f32(mask, vy0, vy1, ux0, ux1, gx, gy);
-        let mut pixel : u32 = 4278190080; // A = 255
         for c in 0..3 {
           // BGRA in the frame and in `out`, RGB in `blurred`.
           let sharp = sample_u8(frame, iy0, iy1, ix0 * 4 + c, ix1 * 4 + c, fx, fy);
@@ -525,9 +515,9 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
           if mode == 1 {
             value = 0.25 * sharp + 0.75 * 255.0 * m;
           }
-          pixel = pixel | (((clamp_dev(value, 0.0, 255.0) + 0.5) as u32) << ((8 * c) as u32));
+          out[oy][ox * 4 + c] = (clamp_dev(value, 0.0, 255.0) + 0.5) as u8;
         }
-        out[oy][ox] = pixel;
+        out[oy][ox * 4 + 3] = 255;
       }
     }
   }
@@ -535,7 +525,7 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
 }
 
 // `crop` is the window that `vxcam_smooth` keeps, or the whole frame.
-pub fn vxcam_composite(out : &mut Tensor<u32, [?, ?], Memory::HBM>,
+pub fn vxcam_composite(out : &mut Tensor<u8, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
 mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::HBM>, w : i32,
 h : i32, scale : i32, mode : i32) -> void {
