@@ -2,7 +2,8 @@
 
 A real-time camera pipeline written in [Vx](https://github.com/vx-lang/Vx): background blur plus
 auto-framing, with each stage placed on the CPU or the GPU of a MacBook. The plan is in
-[`vx-cam-laptop-heterogeneous-proposal.md`](vx-cam-laptop-heterogeneous-proposal.md).
+[`vx-cam-laptop-heterogeneous-proposal.md`](vx-cam-laptop-heterogeneous-proposal.md), filed as
+[vx-lang/Vx#2688](https://github.com/vx-lang/Vx/issues/2688).
 
 ## Status
 
@@ -10,13 +11,13 @@ All five stages are Vx, and every stage is GPU kernels that run on the Apple GPU
 same source, on the CPU. The serial end of `smooth` is host code. Press `1`-`5` to move a stage, or start with `VXCAM_GPU=all` (or names
 separated by commas, such as `VXCAM_GPU=blur,composite`).
 
-| Stage | What it does | Proposal |
+| Stage | What it does | Issue |
 | --- | --- | --- |
-| `preprocess` | BGRA8 frame to a 1/4-size RGB f32 image | #9 |
-| `segment` | Person mask. **Stand-in:** background subtraction, not a model | #10 (model on GPU) |
-| `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone | #11 |
-| `blur` | Separable box blur (two passes, close to a Gaussian) at 1/4 size | #9 |
-| `composite` | Crop and zoom, then mix sharp person and blurred background | #9 |
+| `preprocess` | BGRA8 frame to a 1/4-size RGB f32 image | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
+| `segment` | Person mask. **Stand-in:** background subtraction, not a model | [#3](https://github.com/vx-lang/vx-cam/issues/3) (model on GPU) |
+| `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone | [#4](https://github.com/vx-lang/vx-cam/issues/4) |
+| `blur` | Separable box blur (two passes, close to a Gaussian) at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
+| `composite` | Crop and zoom, then mix sharp person and blurred background | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
 On the M4 (10 cores), over the 360-frame test clip, the middle run of three:
 
@@ -45,7 +46,7 @@ Each stage gives the same bits on both devices. The numbers say where each stage
 
 The stand-in segmentation needs a still background and a person who moves, which is what the
 test clip shows. With the camera, step out of view, press `r` so it learns the empty room, and
-step back in. A live camera needs the real model (#10) to work anywhere.
+step back in. A live camera needs the real model ([#3](https://github.com/vx-lang/vx-cam/issues/3)) to work anywhere.
 
 ## Build and run
 
