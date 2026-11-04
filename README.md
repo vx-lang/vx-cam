@@ -75,9 +75,8 @@ stage between the CPU and the GPU, `r` learn the background again, `o` overlay, 
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
 
 The shell owns every buffer and passes it to Vx as a tensor. It times each stage call for the
-overlay. "Bytes moved" counts the buffers the shell copies, which is none. Inside `smooth`, Vx
-copies the 540 row stats (2 KB) to host memory each frame, until vxc removes that copy on
-unified memory.
+overlay. "Bytes moved" is 0: no stage copies a buffer, on either device. The host code at the
+end of `smooth` reads the GPU's row stats in place.
 
 The shell links two libraries from the Vx build: `libnpu_dispatch.a`, which runs the GPU
 kernels through Metal, and `libvx_std_core.a`, the Vx runtime.
@@ -100,19 +99,21 @@ A tensor crosses into Vx as 7 C arguments per rank-2 tensor (`VXCAM_TENSOR2` in
 stops the program when a `pub fn` gets any other. So a camera frame with padded rows goes in
 as `[height, bytesPerRow]`, padding included.
 
-What vxc asks of a kernel, as of the `metal-backend` branch:
+What vxc asks of the code, as of the `metal-backend` branch:
 
 - vxc proves that no two lanes of a kernel write the same element. `composite` writes the
   four bytes of its pixel at `x * 4 + c`, and vxc sees that lane `x` owns those bytes.
-- A helper function that a kernel calls says `on Topology::Device` and what memory it
-  touches (`ensures writes_only()` or `ensures reads_only(t)`). vxc inlines it into the Metal
-  code. The conversions in `core::convert`, such as `f32::from` for a byte, say this already.
+- A helper function says where it runs and what memory it touches (`ensures writes_only()`
+  or `ensures reads_only(t)`). vxc inlines it into the Metal code. The scalar helpers are
+  generic over the topology, `fn f<D : Topology>(..) on Topology::D`, so the kernels and the
+  host code in `smooth` call the same ones. The samplers say `on Topology::Device`. The
+  conversions in `core::convert`, such as `f32::from` for a byte, work on either side.
 - Host code reads a tensor in `HBM` through `transfer(t, Memory::CPU_DRAM)`, which waits for
   the GPU and gives an owned copy in host memory. Reading it without a transfer is an error
   (E6003). The end of `smooth` reads its row stats this way. The type is a copy on every
-  machine. On unified memory vxc is to drop the copy as an optimization.
-- Host code cannot call a function that is `on Topology::Device` (E6001), so the end of
-  `smooth` has host copies of `clamp`, `max` and `abs`.
+  machine. `fleet/m4-uma.vx` says `transfer Memory::HBM -> Memory::CPU_DRAM : shared`, so
+  when a function only reads the copy, vxc drops it and reads the GPU's memory in place after
+  the wait. If the function writes the copy or lets it escape, vxc copies and warns.
 - The Apple GPU flushes subnormal floats to zero and the CPU copy does not
   ([vx-lang/Vx#2650](https://github.com/vx-lang/Vx/issues/2650)). `smooth` zeroes mask values
   below 1e-6, which would otherwise decay into subnormals and differ.
