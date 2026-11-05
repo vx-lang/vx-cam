@@ -19,8 +19,9 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `blur` | Separable Gaussian blur at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size. It can draw a green line where the mask crosses 0.5 | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
-On a MacBook Air with an M4 (10 cores), with Vx at a68d5641: Vx main, plus
-[vx-lang/Vx#2841](https://github.com/vx-lang/Vx/pull/2841) (open on 2026-11-05). Each row is the
+On a MacBook Air with an M4 (10 cores), with Vx at a68d5641, the code of
+[vx-lang/Vx#2841](https://github.com/vx-lang/Vx/pull/2841), which merged into Vx main on
+2026-11-05 as 6165a7d0. Each row is the
 median of five runs over the 360 frames of the test clip, with the runs taken in turn
 (`make bench`, [below](#measurements)):
 
@@ -36,8 +37,9 @@ Each stage gives the same bits on both devices. The numbers say where each stage
 
 - The fastest is the model on both devices at once. With `VXCAM_ALTERNATE=1`, the GPU runs it
   for the even frames while the CPU runs it for the odd ones, and smooth, blur and composite run
-  on the CPU: 7.06 ms a frame (142 frames a second), 1.28x as fast as all on the GPU in the same
-  runs. The output is the same to the bit as all on the CPU.
+  on the CPU: 7.06 ms a frame (142 frames a second). All on the GPU took 9.06 ms in the same
+  runs (9.01 ms in the runs of the table), so this is 1.28x as fast. The output is the same to
+  the bit as all on the CPU.
 - With each stage on one device, all on the GPU is the fastest of the 32 placements: 9.01 ms a
   frame (111 frames a second). All on the CPU takes 12.60 ms.
 - `segment` takes about the same on either device: 6.6 ms on the GPU, 7.3 ms on ten cores. The
@@ -80,7 +82,7 @@ learns the empty room, and step back in.
 
 `make bench` ([`tools/bench.py`](tools/bench.py)) measures what this README claims and writes
 `build/bench/report.md` and `results.json`. The numbers here are from one run of it on
-2026-11-05, on the MacBook Air (M4) with Vx a68d5641 (main plus #2841), on AC power. The load
+2026-11-05, on the MacBook Air (M4) with Vx a68d5641 (the code of #2841, now on main), on AC power. The load
 average was 2.8 to 4 (up to 6 in the last part), with other sessions' work and `syspolicyd`
 taking about two cores, so a quiet machine may be a little faster.
 
@@ -122,7 +124,9 @@ two or three threads:
   composite (and blur, when it is on composite's device) for this one. All on the GPU, it takes
   8.01 ms against 9.01 ms (1.12x), the fastest of the 32 placements with overlap. Placements that
   split the stages gain more, such as blur and composite on the GPU: 9.18 ms against 11.58 ms
-  (1.26x). One loses: segment alone on the GPU, 18.37 ms against 12.11 ms.
+  (1.26x). One loses: segment alone on the GPU, 18.37 ms against 12.11 ms. Overlap is also
+  uneven: all on the GPU, one run of five took 21.23 ms, and that happens again outside
+  `make bench`. The cause is not known yet.
 - `VXCAM_ALTERNATE=1`: the model runs on the GPU for the even frames and on the CPU for the odd
   ones, on two threads, while a third runs smooth, blur and composite on each frame in order. The
   output is the same to the bit, because the two devices compute the same bits. In the same
@@ -136,6 +140,8 @@ two or three threads:
 | the model on both devices, the rest on the GPU | the model alternates | 8.70 ms |
 | all on the GPU | one after another | 9.06 ms |
 | the model on both devices, composite on the GPU | the model alternates | 10.66 ms |
+
+The model alternating with the rest on the CPU is steady: its five runs took 6.90 to 7.85 ms.
 
 Both modes need [vx-lang/Vx#2841](https://github.com/vx-lang/Vx/pull/2841): each thread has its own
 command buffer, and a wait waits only for the GPU work on its memory. Without it, a wait on one
@@ -183,9 +189,10 @@ merged ([vx-lang/Vx#2747](https://github.com/vx-lang/Vx/pull/2747) to
 [#2751](https://github.com/vx-lang/Vx/pull/2751)), with `on Topology::Any`
 ([#2731](https://github.com/vx-lang/Vx/pull/2731)). The Makefile looks for it in `~/go/Vx`. Set
 `VX=/path/to/Vx` (and `VX_CONFIG`) if it is elsewhere. The numbers above need Vx main from
-later on 2026-11-05 ([#2812](https://github.com/vx-lang/Vx/pull/2812) and
-[#2816](https://github.com/vx-lang/Vx/pull/2816)), and for the two modes that run frames at once,
-[#2841](https://github.com/vx-lang/Vx/pull/2841) as well. The build writes the Vx commit to
+later on 2026-11-05, with [#2812](https://github.com/vx-lang/Vx/pull/2812),
+[#2816](https://github.com/vx-lang/Vx/pull/2816) and, for the two modes that run frames at
+once, [#2841](https://github.com/vx-lang/Vx/pull/2841). vx-cam was last checked with Vx main
+dc066c17. The build writes the Vx commit to
 `build/vx-commit.txt`, and recompiles the pipeline when `vxc` or the runtime changes.
 
 ```sh
