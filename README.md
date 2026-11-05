@@ -20,56 +20,57 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
 On the M4 (10 cores), the median over the 360 frames of the test clip, from the middle run of
-five, with other work on the machine:
+five. Other sessions' builds were running on the machine. With less of that, all on the CPU
+took 11.4 ms a frame.
 
 | | preprocess | segment | smooth | blur | composite | whole frame |
 | --- | --- | --- | --- | --- | --- | --- |
-| all on the CPU | 0.19 ms | 0.07 ms | 0.17 ms | 0.87 ms | 2.19 ms | 3.56 ms |
-| all on the GPU | 0.34 ms | 0.27 ms | 0.67 ms | 1.09 ms | 0.46 ms | 2.83 ms |
-| `VXCAM_GPU=blur,composite` | 0.24 ms | 0.06 ms | 0.17 ms | 1.16 ms | 0.48 ms | 2.10 ms |
-
-These numbers are from before the Gaussian blur and the guided filter (977bd9e). The Gaussian
-blur makes two launches in place of four, and takes 0.69 ms on the GPU in place of 1.09 ms. The
-guided filter's four kernels add about 1.2 ms to `smooth` on the GPU, which is mostly the wait
-of four more launches, and 0.8 to 1.5 ms on the CPU, depending on what else runs. The table
-will be measured again on an idle machine.
+| all on the CPU | 0.19 ms | 7.48 ms | 1.16 ms | 1.03 ms | 2.80 ms | 12.77 ms |
+| `VXCAM_GPU=composite` | 0.25 ms | 7.37 ms | 1.12 ms | 1.01 ms | 1.30 ms | 11.08 ms |
+| `VXCAM_GPU=blur,composite` | 0.25 ms | 7.23 ms | 1.08 ms | 1.65 ms | 1.22 ms | 11.45 ms |
+| all on the GPU, high clock | 0.36 ms | 21.21 ms | 2.00 ms | 0.72 ms | 0.54 ms | 24.85 ms |
+| all on the GPU, low clock | 0.42 ms | 38.05 ms | 2.72 ms | 1.28 ms | 1.03 ms | 43.76 ms |
 
 Each stage gives the same bits on both devices. The numbers say where each stage belongs:
 
-- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.46 ms,
-  against 2.19 ms on all ten cores.
+- `segment` belongs on the CPU for now: about 7 ms on ten cores, against 21 ms on the GPU. The
+  model is 58 small launches a frame, and each one waits for the GPU (below).
+- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.54 ms at the
+  GPU's high clock and 1.3 ms at its low one, against 2.8 ms on all ten cores. So the best
+  placement is `VXCAM_GPU=composite`, 11.1 ms a frame, a third of the 33 ms budget.
 - The other stages work at 1/4 size. Each GPU launch waits for the GPU to finish, so a small
   stage costs more on the GPU than on the CPU. `smooth` ends in serial work (reduce the rows
   to one box, ease the crop window), which is host code on either device.
-- `blur` is close. On the CPU it is faster, but then `composite` is the only GPU launch of the
-  frame and takes 0.81 ms rather than 0.48 ms. The two placements tie at 2.1 ms a frame.
+- `blur` used to tie between the devices. With the model on the CPU, the GPU gets one or two
+  launches a frame, and macOS keeps it at the low clock, where `blur` takes 1.65 ms against
+  1.0 ms on the CPU.
 - The CPU copy of a kernel shares its blocks among the cores
   ([vx-lang/Vx#2649](https://github.com/vx-lang/Vx/issues/2649)). Before that it ran on one
   thread, and `composite` on the CPU took 10.6 ms.
 - Most of the time of a GPU stage is not GPU work. A launch takes about 0.12 ms from its commit
   to the start of the kernel, and about 0.10 ms from the end of the kernel until the waiting
-  thread runs again. All on the GPU, a frame makes 10 launches, so about 2.2 ms of its 2.8 ms is
-  this wait. The kernels themselves take about 0.45 ms. One command buffer and one wait for the
-  kernels of a stage would remove most of it ([vx-lang/Vx#2781](https://github.com/vx-lang/Vx/issues/2781)).
+  thread runs again. All on the GPU, a frame makes 69 launches, so about 15 ms of its 25 ms is
+  this wait. One command buffer and one wait for the kernels of a stage would remove most of it
+  ([vx-lang/Vx#2781](https://github.com/vx-lang/Vx/issues/2781)).
 - The GPU changes its clock during a run. The same kernel takes about 0.04 ms at the high clock
-  and 0.15 ms at the low one, and a run can switch either way, which made some runs look three
-  times slower. Since the GPU sits idle for most of each launch, macOS often keeps it at the low
-  clock. `--headless` reports the median of each stage, so that one switch does not decide the
-  numbers. The overlay shows a moving average.
+  and 0.15 ms at the low one. All on the GPU, a frame takes 25 ms at the high clock and 44 ms at
+  the low one. Runs landed on either, and some switched partway. Since the GPU sits idle for
+  most of each launch, macOS often keeps it at the low clock. `--headless` reports the median of
+  each stage, so that one switch does not decide the numbers. The overlay shows a moving
+  average.
 
 The segmentation model is MediaPipe Selfie Segmentation, the landscape version (Google, Apache
 License 2.0; see [models/README.md](models/README.md)). It is written in Vx as 58 kernel launches
 a frame: convolutions, depthwise convolutions, squeeze-and-excite gates and a decoder. Its mask
-matches TFLite's to within 3e-5 on the test clip (`tools/check_model.py`), and is the same to
-the bit on the CPU and the GPU. Its sigmoid uses an `exp` made of `+ - * /` only, so that both
-devices compute the same bits. On the M4, `segment` takes about 6 ms on the CPU and 21 ms on
-the GPU: on the GPU it is 58 waits of the kind that
-[vx-lang/Vx#2781](https://github.com/vx-lang/Vx/issues/2781) would remove. So it belongs on the
-CPU for now. The table above is from before the model.
+matches TFLite's to within 3e-5 on the test clip and 6e-5 on a recording from the laptop's
+camera, with the same person pixels (`tools/check_model.py`). It is the same to the bit on the
+CPU and the GPU. Its sigmoid uses an `exp` made of `+ - * /` only, so that both devices
+compute the same bits.
 
-The model was trained on photos of real people, and the test clip is a drawing, so on the clip
-it finds the head more surely than the body. The smoothing and the guided filter fill in the
-rest. `VXCAM_SEGMENT=standin` runs the old stand-in, background subtraction: it needs a still
+The model was trained on photos of real people. On the camera recording it outlines the
+person, hair included. The test clip is a drawing, so on the clip it finds the head more
+surely than the body, and the smoothing and the guided filter fill in the rest.
+`VXCAM_SEGMENT=standin` runs the old stand-in, background subtraction: it needs a still
 background and a person who moves. With it and the camera, step out of view, press `r` so it
 learns the empty room, and step back in.
 
@@ -91,7 +92,8 @@ make check    # run the whole clip on the CPU, then with the kernels on the GPU;
 ```
 
 Keys in the window: `m` mask view, `b` blur off, `f` auto-framing off, `1`-`5` move a
-stage between the CPU and the GPU, `r` learn the background again, `o` overlay, space pause, `q` quit.
+stage between the CPU and the GPU, `r` learn the background again (stand-in only), `o` overlay,
+space pause, `q` quit.
 
 ## Layout
 

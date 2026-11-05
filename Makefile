@@ -39,13 +39,13 @@ build/test_clip.mov: build/make_test_clip
 run: all
 	./build/vx-cam build/test_clip.mov
 
-# The default camera. macOS asks once for permission. Step out of view and press r,
-# so the stand-in segmentation learns the empty room, then step back in.
+# The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
+# of view and press r, so the stand-in learns the empty room, then step back in.
 camera: build/vx-cam
 	./build/vx-cam --camera
 
 # Runs the whole clip without a window, once with every stage on the CPU and once
-# with the GPU stages (preprocess, blur, composite) on the GPU. Prints the stage
+# with every stage on the GPU. Prints the stage
 # tables, compares each GPU stage with its CPU copy bit for bit, and writes
 # snapshots (frame and mask view) to build/snapshots.
 check: all
