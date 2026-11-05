@@ -224,7 +224,8 @@ sw : i32, sh : i32, frame_index : i32) -> void {
 //   - Find the person's bounding box and move the crop window toward a frame
 //     around it. Small moves are ignored, so the window does not jitter.
 // `history` and `crop` keep their values from one frame to the next. After the
-// stage, `history` is the softened mask that composite reads.
+// stage, `history` is the softened mask, and the guided filter below turns it
+// into the `ab` that composite reads.
 //
 // Three GPU kernels, so the per-pixel part can move to the GPU like the other
 // stages: the blend and the box filter along rows, the box filter along columns,
@@ -399,6 +400,116 @@ sw : i32, sh : i32, w : i32, h : i32, frame_index : i32) -> void {
 }
 
 //===----------------------------------------------------------------------===//
+// The end of smooth: a guided filter (He, Sun and Tang, 2010) fits the mask to
+// the edges of the image. In each window, the mask is close to a * I + b, where
+// I is the gray of the image. smooth finds a and b at 1/4 size and keeps their
+// mean over each window in `ab`. composite takes a * I + b with I from the sharp
+// frame, so the edge of the mask follows the edges of the frame at full size
+// (the fast guided filter, He and Sun, 2015).
+//
+// Four GPU kernels, each a box filter of radius `r` along the rows or the
+// columns. `sums` and `means` are [sh, 4 * sw]: the means of I, p, I * p and
+// I * I over a window, where p is the mask. `coefs` and `ab` are [sh, 2 * sw]:
+// a and b.
+//===----------------------------------------------------------------------===//
+
+// The gray of an RGB pixel, the guide of the filter.
+fn gray(r : f32, g : f32, b : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+// sums = the means along each row of I, p, I * p and I * I.
+fn guide_rows(sums : &mut Tensor<f32, [?, ?], Memory::HBM>,
+small : &Tensor<f32, [?, ?], Memory::HBM>, mask : &Tensor<f32, [?, ?], Memory::HBM>,
+sw : i32, sh : i32, r : i32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..sh across blocks {
+      for x in 0..sw across lanes(256) {
+        let mut si : f32 = 0.0;
+        let mut sp : f32 = 0.0;
+        let mut sip : f32 = 0.0;
+        let mut sii : f32 = 0.0;
+        for d in 0..2 * r + 1 {
+          let xx = clamp_i32(x + d - r, 0, sw - 1);
+          let i = gray(small[y][xx * 3], small[y][xx * 3 + 1], small[y][xx * 3 + 2]);
+          let p = mask[y][xx];
+          si = si + i;
+          sp = sp + p;
+          sip = sip + i * p;
+          sii = sii + i * i;
+        }
+        let n = (2 * r + 1) as f32;
+        sums[y][x * 4] = si / n;
+        sums[y][x * 4 + 1] = sp / n;
+        sums[y][x * 4 + 2] = sip / n;
+        sums[y][x * 4 + 3] = sii / n;
+      }
+    }
+  }
+  return;
+}
+
+// dst = the mean along each column of src, over 2 * r + 1 rows.
+fn box_cols(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
+src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..cols across blocks {
+      for y in 0..rows across lanes(256) {
+        let mut acc : f32 = 0.0;
+        for d in 0..2 * r + 1 {
+          acc = acc + src[clamp_i32(y + d - r, 0, rows - 1)][i];
+        }
+        dst[y][i] = acc / ((2 * r + 1) as f32);
+      }
+    }
+  }
+  return;
+}
+
+// coefs = the means along each row of a and b, where at each pixel
+// a = (mean(I * p) - mean(I) * mean(p)) / (var(I) + eps) and b = mean(p) - a * mean(I).
+fn coef_rows(coefs : &mut Tensor<f32, [?, ?], Memory::HBM>,
+means : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32, r : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..sh across blocks {
+      for x in 0..sw across lanes(256) {
+        let mut sa : f32 = 0.0;
+        let mut sb : f32 = 0.0;
+        for d in 0..2 * r + 1 {
+          let k = clamp_i32(x + d - r, 0, sw - 1) * 4;
+          let mi = means[y][k];
+          let mp = means[y][k + 1];
+          let a = (means[y][k + 2] - mi * mp) / (means[y][k + 3] - mi * mi + eps);
+          sa = sa + a;
+          sb = sb + (mp - a * mi);
+        }
+        let n = (2 * r + 1) as f32;
+        coefs[y][x * 2] = sa / n;
+        coefs[y][x * 2 + 1] = sb / n;
+      }
+    }
+  }
+  return;
+}
+
+// A window of 9 x 9 small pixels (36 frame pixels across). A larger eps gives
+// a smoother mask; a smaller one follows weaker edges.
+pub fn vxcam_guide(ab : &mut Tensor<f32, [?, ?], Memory::HBM>,
+sums : &mut Tensor<f32, [?, ?], Memory::HBM>, means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+coefs : &mut Tensor<f32, [?, ?], Memory::HBM>, small : &Tensor<f32, [?, ?], Memory::HBM>,
+history : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
+  let r : i32 = 4;
+  let eps : f32 = 0.001;
+  guide_rows(sums, small, history, sw, sh, r);
+  box_cols(means, sums, sh, 4 * sw, r);
+  coef_rows(coefs, means, sw, sh, r, eps);
+  box_cols(ab, coefs, sh, 2 * sw, r);
+  return;
+}
+
+//===----------------------------------------------------------------------===//
 // Stage 4: blur. A separable Gaussian blur of the small image: one pass along
 // the rows, then one along the columns. The composite stage scales it up to the
 // frame, so a sigma of r small pixels is a sigma of r * scale frame pixels.
@@ -485,7 +596,8 @@ weights : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, radius : i3
 //
 // A GPU kernel, one lane per output pixel. `frame` is `[h, stride]` bytes as in
 // preprocess, `out` is `[h, 4 * w]` BGRA bytes, `blurred` is `[sh, 3 * sw]` and
-// `mask` is `[sh, sw]`.
+// `ab` is `[sh, 2 * sw]`, the guided filter's a and b from smooth. The mask at a
+// pixel is a * I + b, where I is the gray of the sharp frame there.
 //===----------------------------------------------------------------------===//
 
 // The window's corner is (x0, y0) in frame pixels, and kx, ky scale output
@@ -493,7 +605,7 @@ weights : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, radius : i3
 // pixels.
 fn composite_kernel(out : &mut Tensor<u8, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
-mask : &Tensor<f32, [?, ?], Memory::HBM>, x0 : f32, y0 : f32, kx : f32, ky : f32,
+ab : &Tensor<f32, [?, ?], Memory::HBM>, x0 : f32, y0 : f32, kx : f32, ky : f32,
 inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
   spawn on(Topology::Device) {
     for oy in 0..h across blocks {
@@ -515,10 +627,21 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
         let ux0 = u as i32;
         let ux1 = min_i32(ux0 + 1, sw - 1);
         let gx = u - ux0 as f32;
-        let m = sample_f32(mask, vy0, vy1, ux0, ux1, gx, gy);
+        // BGRA in the frame and in `out`, RGB in `blurred`.
+        let sb = sample_u8(frame, iy0, iy1, ix0 * 4, ix1 * 4, fx, fy);
+        let sg = sample_u8(frame, iy0, iy1, ix0 * 4 + 1, ix1 * 4 + 1, fx, fy);
+        let sr = sample_u8(frame, iy0, iy1, ix0 * 4 + 2, ix1 * 4 + 2, fx, fy);
+        let a = sample_f32(ab, vy0, vy1, ux0 * 2, ux1 * 2, gx, gy);
+        let b = sample_f32(ab, vy0, vy1, ux0 * 2 + 1, ux1 * 2 + 1, gx, gy);
+        let m = clamp_f32(a * gray(sr, sg, sb) / 255.0 + b, 0.0, 1.0);
         for c in 0..3 {
-          // BGRA in the frame and in `out`, RGB in `blurred`.
-          let sharp = sample_u8(frame, iy0, iy1, ix0 * 4 + c, ix1 * 4 + c, fx, fy);
+          let mut sharp = sb;
+          if c == 1 {
+            sharp = sg;
+          }
+          if c == 2 {
+            sharp = sr;
+          }
           let k = 2 - c;
           let soft = 255.0 * sample_f32(blurred, vy0, vy1, ux0 * 3 + k, ux1 * 3 + k, gx, gy);
           let mut value = sharp;
@@ -541,12 +664,12 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
 // memory.
 pub fn vxcam_composite(out : &mut Tensor<u8, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, blurred : &Tensor<f32, [?, ?], Memory::HBM>,
-mask : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+ab : &Tensor<f32, [?, ?], Memory::HBM>, crop : &Tensor<f32, [?, ?], Memory::CPU_DRAM>,
 w : i32, h : i32, scale : i32, mode : i32) -> void {
   let inv_scale : f32 = 1.0 / (scale as f32);
   let kx = crop[0][2] / (w as f32);
   let ky = crop[0][3] / (h as f32);
-  composite_kernel(out, frame, blurred, mask, crop[0][0], crop[0][1], kx, ky, inv_scale, w, h,
+  composite_kernel(out, frame, blurred, ab, crop[0][0], crop[0][1], kx, ky, inv_scale, w, h,
   w / scale, h / scale, mode);
   return;
 }

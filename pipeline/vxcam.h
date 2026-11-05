@@ -28,7 +28,9 @@ void vx_metal_set_enabled(int on);
 //   small    RGB f32, sh rows of 3 * sw floats; blurred and scratch the same
 //   mask     f32, sh rows of sw floats
 //   background  RGB f32 like small; segment updates it in place each frame
-//   history  f32 like mask; smooth keeps it from frame to frame, and composite reads it
+//   history  f32 like mask; smooth keeps it from frame to frame
+//   sums, means  f32, sh rows of 4 * sw: the guided filter's window means
+//   coefs, ab    f32, sh rows of 2 * sw: its a and b; composite reads ab
 //   stats    int32, sh rows of 3: each row's part of the person's bounding box
 //   crop     4 floats: x0, y0, width and height of the output window
 //   out      BGRA8, h rows of w pixels
@@ -73,6 +75,19 @@ static inline void vxcam_gaussian(float *weights, int32_t radius) {
   vxcam_blur_weights(VXCAM_TENSOR2(weights, 1, 6 * radius + 1), radius);
 }
 
+void vxcam_guide(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
+                 VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(const float),
+                 VXCAM_TENSOR2_ARGS(const float), int32_t sw, int32_t sh);
+
+static inline void vxcam_guide_mask(float *ab, float *sums, float *means, float *coefs,
+                                    const float *small, const float *history, int64_t sw,
+                                    int64_t sh) {
+  vxcam_guide(VXCAM_TENSOR2(ab, sh, 2 * sw), VXCAM_TENSOR2(sums, sh, 4 * sw),
+              VXCAM_TENSOR2(means, sh, 4 * sw), VXCAM_TENSOR2(coefs, sh, 2 * sw),
+              VXCAM_TENSOR2(small, sh, 3 * sw), VXCAM_TENSOR2(history, sh, sw), (int32_t)sw,
+              (int32_t)sh);
+}
+
 void vxcam_blur(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
                 VXCAM_TENSOR2_ARGS(const float), VXCAM_TENSOR2_ARGS(const float), int32_t rows,
                 int32_t cols, int32_t radius);
@@ -91,12 +106,12 @@ void vxcam_composite(VXCAM_TENSOR2_ARGS(uint8_t), VXCAM_TENSOR2_ARGS(const uint8
                      int32_t mode);
 
 static inline void vxcam_composite_frame(uint8_t *out, const uint8_t *frame,
-                                         const float *blurred, const float *mask,
+                                         const float *blurred, const float *ab,
                                          const float *crop, int64_t w, int64_t h,
                                          int64_t stride, int32_t scale, int32_t mode) {
   int64_t sw = w / scale, sh = h / scale;
   vxcam_composite(VXCAM_TENSOR2(out, h, 4 * w), VXCAM_TENSOR2(frame, h, stride),
-                  VXCAM_TENSOR2(blurred, sh, 3 * sw), VXCAM_TENSOR2(mask, sh, sw),
+                  VXCAM_TENSOR2(blurred, sh, 3 * sw), VXCAM_TENSOR2(ab, sh, 2 * sw),
                   VXCAM_TENSOR2(crop, 1, 4), (int32_t)w, (int32_t)h, scale, mode);
 }
 

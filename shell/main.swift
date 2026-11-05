@@ -158,6 +158,7 @@ final class Pipeline {
   // Every buffer is shared: a stage on either device reads and writes it in place.
   let out: Shared<UInt8>
   private let small, blurred, scratch, background, mask, history, maskScratch: Shared<Float>
+  private let sums, means, coefs, ab: Shared<Float>  // the guided filter of the mask
   private let stats: Shared<Int32>
   /// The crop window that smooth keeps, and the whole frame for when framing is off.
   private let crop, fullFrame: Shared<Float>
@@ -175,6 +176,8 @@ final class Pipeline {
     mask = Shared(count: n)
     history = Shared(count: n)
     maskScratch = Shared(count: n)
+    sums = Shared(count: n * 4); means = Shared(count: n * 4)
+    coefs = Shared(count: n * 2); ab = Shared(count: n * 2)
     stats = Shared(count: (h / 4) * 3)
     crop = Shared(count: 4)
     fullFrame = Shared(count: 4)
@@ -209,6 +212,7 @@ final class Pipeline {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     vxcam_smooth_mask(history.ptr, maskScratch.ptr, mask.ptr, stats.ptr, crop.ptr, Int64(sw),
                       Int64(sh), Int64(w), Int64(h), Int64(frameIndex))
+    vxcam_guide_mask(ab.ptr, sums.ptr, means.ptr, coefs.ptr, small.ptr, history.ptr, Int64(sw), Int64(sh))
   }
 
   private func runBlur(onGPU: Bool) {
@@ -220,7 +224,7 @@ final class Pipeline {
   private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     let window = autoFraming ? crop : fullFrame
-    vxcam_composite_frame(out.ptr, frame, blurred.ptr, history.ptr, window.ptr, Int64(w), Int64(h),
+    vxcam_composite_frame(out.ptr, frame, blurred.ptr, ab.ptr, window.ptr, Int64(w), Int64(h),
                           Int64(stride), Int32(scale), Int32(mode))
   }
 
@@ -278,6 +282,7 @@ final class Pipeline {
       // No row statistic is 0x7F7F7F7F, so a skipped one cannot match.
       compare("smooth stats", stats, fills: [0x7F], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
       compare("smooth crop", crop, fills: [nil], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
+      compare("smooth guide", ab, fills: [-1], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
       compare("blur", blurred, fills: [-1], { Double($0) }) { runBlur(onGPU: $0) },
       compare("composite", out, fills: [0x00, 0xFF], { Double($0) }) { runComposite(frame, stride, onGPU: $0) },
     ]

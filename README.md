@@ -15,9 +15,9 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | --- | --- | --- |
 | `preprocess` | BGRA8 frame to a 1/4-size RGB f32 image | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `segment` | Person mask. **Stand-in:** background subtraction, not a model | [#3](https://github.com/vx-lang/vx-cam/issues/3) (model on GPU) |
-| `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone | [#4](https://github.com/vx-lang/vx-cam/issues/4) |
+| `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone, and a guided filter that fits the mask to the edges of the image | [#4](https://github.com/vx-lang/vx-cam/issues/4), [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `blur` | Separable Gaussian blur at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
-| `composite` | Crop and zoom, then mix sharp person and blurred background | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
+| `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
 On the M4 (10 cores), the median over the 360 frames of the test clip, from the middle run of
 five, with other work on the machine:
@@ -27,6 +27,12 @@ five, with other work on the machine:
 | all on the CPU | 0.19 ms | 0.07 ms | 0.17 ms | 0.87 ms | 2.19 ms | 3.56 ms |
 | all on the GPU | 0.34 ms | 0.27 ms | 0.67 ms | 1.09 ms | 0.46 ms | 2.83 ms |
 | `VXCAM_GPU=blur,composite` | 0.24 ms | 0.06 ms | 0.17 ms | 1.16 ms | 0.48 ms | 2.10 ms |
+
+These numbers are from before the Gaussian blur and the guided filter (977bd9e). The Gaussian
+blur makes two launches in place of four, and takes 0.69 ms on the GPU in place of 1.09 ms. The
+guided filter's four kernels add about 1.2 ms to `smooth` on the GPU, which is mostly the wait
+of four more launches, and 0.8 to 1.5 ms on the CPU, depending on what else runs. The table
+will be measured again on an idle machine.
 
 Each stage gives the same bits on both devices. The numbers say where each stage belongs:
 
