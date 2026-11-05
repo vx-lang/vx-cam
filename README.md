@@ -16,7 +16,7 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `preprocess` | BGRA8 frame to a 1/4-size RGB f32 image | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `segment` | Person mask. **Stand-in:** background subtraction, not a model | [#3](https://github.com/vx-lang/vx-cam/issues/3) (model on GPU) |
 | `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone | [#4](https://github.com/vx-lang/vx-cam/issues/4) |
-| `blur` | Separable box blur (two passes, close to a Gaussian) at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
+| `blur` | Separable Gaussian blur at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `composite` | Crop and zoom, then mix sharp person and blurred background | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
 On the M4 (10 cores), the median over the 360 frames of the test clip, from the middle run of

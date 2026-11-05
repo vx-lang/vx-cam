@@ -66,13 +66,23 @@ static inline void vxcam_smooth_mask(float *history, float *scratch, const float
                (int32_t)sw, (int32_t)sh, (int32_t)w, (int32_t)h, (int32_t)frame_index);
 }
 
+// weights  6 * radius + 1 floats: the Gaussian that blur uses, from vxcam_blur_weights
+void vxcam_blur_weights(VXCAM_TENSOR2_ARGS(float), int32_t radius);
+
+static inline void vxcam_gaussian(float *weights, int32_t radius) {
+  vxcam_blur_weights(VXCAM_TENSOR2(weights, 1, 6 * radius + 1), radius);
+}
+
 void vxcam_blur(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
-                VXCAM_TENSOR2_ARGS(const float), int32_t rows, int32_t cols, int32_t radius);
+                VXCAM_TENSOR2_ARGS(const float), VXCAM_TENSOR2_ARGS(const float), int32_t rows,
+                int32_t cols, int32_t radius);
 
 static inline void vxcam_blur_image(float *blurred, float *scratch, const float *small,
-                                    int64_t sw, int64_t sh, int32_t radius) {
+                                    const float *weights, int64_t sw, int64_t sh,
+                                    int32_t radius) {
   vxcam_blur(VXCAM_TENSOR2(blurred, sh, 3 * sw), VXCAM_TENSOR2(scratch, sh, 3 * sw),
-             VXCAM_TENSOR2(small, sh, 3 * sw), (int32_t)sh, (int32_t)(3 * sw), radius);
+             VXCAM_TENSOR2(small, sh, 3 * sw), VXCAM_TENSOR2(weights, 1, 6 * radius + 1),
+             (int32_t)sh, (int32_t)(3 * sw), radius);
 }
 
 void vxcam_composite(VXCAM_TENSOR2_ARGS(uint8_t), VXCAM_TENSOR2_ARGS(const uint8_t),

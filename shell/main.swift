@@ -149,7 +149,7 @@ final class Pipeline {
   var frameIndex = 0
   var mode = 0            // 0 normal, 1 mask, 2 no blur
   var autoFraming = true
-  var blurRadius = 4
+  let blurRadius = 4  // the sigma of the Gaussian blur, in small pixels
   /// Every stage is GPU kernels, and each can run on either device.
   var stages = ["preprocess", "segment", "smooth", "blur", "composite"].map { StageInfo(name: $0) }
   var frameMs: Double = 0
@@ -161,6 +161,7 @@ final class Pipeline {
   private let stats: Shared<Int32>
   /// The crop window that smooth keeps, and the whole frame for when framing is off.
   private let crop, fullFrame: Shared<Float>
+  private let weights: Shared<Float>  // the blur's Gaussian
 
   /// `gpu` names the stages that start on the GPU: "all", or names separated by commas.
   init(w: Int, h: Int, gpu: String = ProcessInfo.processInfo.environment["VXCAM_GPU"] ?? "") {
@@ -179,6 +180,8 @@ final class Pipeline {
     fullFrame = Shared(count: 4)
     fullFrame.ptr[2] = Float(w)
     fullFrame.ptr[3] = Float(h)
+    weights = Shared(count: 6 * blurRadius + 1)
+    vxcam_gaussian(weights.ptr, Int32(blurRadius))
     let names = Set(gpu.split(separator: ",").map(String.init))
     for i in stages.indices where gpu == "all" || names.contains(stages[i].name) {
       stages[i].device = "GPU"
@@ -210,7 +213,8 @@ final class Pipeline {
 
   private func runBlur(onGPU: Bool) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
-    vxcam_blur_image(blurred.ptr, scratch.ptr, small.ptr, Int64(sw), Int64(sh), Int32(blurRadius))
+    vxcam_blur_image(blurred.ptr, scratch.ptr, small.ptr, weights.ptr, Int64(sw), Int64(sh),
+                     Int32(blurRadius))
   }
 
   private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool) {

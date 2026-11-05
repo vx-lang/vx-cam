@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 import core::convert;
+import core::num;
 
 //===----------------------------------------------------------------------===//
 // Helpers. A function says where it runs. The scalar helpers say
@@ -398,18 +399,42 @@ sw : i32, sh : i32, w : i32, h : i32, frame_index : i32) -> void {
 }
 
 //===----------------------------------------------------------------------===//
-// Stage 4: blur. Blur the small image with two box passes per direction, which
-// is close to a Gaussian. The composite stage scales it up to the frame, so a
-// radius of r small pixels is a radius of r * scale frame pixels.
+// Stage 4: blur. A separable Gaussian blur of the small image: one pass along
+// the rows, then one along the columns. The composite stage scales it up to the
+// frame, so a sigma of r small pixels is a sigma of r * scale frame pixels.
 //
 // The passes are GPU kernels. `vx_metal_set_enabled(0)` runs the CPU copy of
 // the same kernels on the same memory, so the CPU and the GPU run one source.
 // The images are interleaved RGB: `rows` x `cols` floats, cols = 3 * width.
+// The weights come from `vxcam_blur_weights`, once, so that `exp` runs on the
+// CPU only and both devices read the same table.
 //===----------------------------------------------------------------------===//
 
-// One box pass of radius `r` along each row. `n` is 2 * r + 1 as a float.
+// The weights of a Gaussian with a sigma of `radius` small pixels, out to
+// 3 * radius on each side, scaled to sum to 1. `weights` is [1, 6 * radius + 1].
+pub fn vxcam_blur_weights(weights : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+radius : i32) -> void {
+  let reach = 3 * radius;
+  let sigma = radius as f32;
+  let mut total : f32 = 0.0;
+  for d in 0..2 * reach + 1 {
+    let x = (d - reach) as f32;
+    let e : f32 = 0.0 - x * x / (2.0 * sigma * sigma);
+    let v = e.exp();
+    weights[0][d] = v;
+    total = total + v;
+  }
+  for d in 0..2 * reach + 1 {
+    weights[0][d] = weights[0][d] / total;
+  }
+  return;
+}
+
+// One Gaussian pass along each row: element d of `weights` scales the pixel
+// d - reach away, and the edge pixel stands in past the edge.
 fn blur_rows(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
-src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f32) -> void {
+src : &Tensor<f32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>,
+rows : i32, cols : i32, reach : i32) -> void {
   spawn on(Topology::Device) {
     for y in 0..rows across blocks {
       for i in 0..cols across lanes(256) {
@@ -417,27 +442,28 @@ src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f3
         let c = i - x * 3;
         let last = cols / 3 - 1;
         let mut acc : f32 = 0.0;
-        for d in 0..2 * r + 1 {
-          acc = acc + src[y][clamp_i32(x + d - r, 0, last) * 3 + c];
+        for d in 0..2 * reach + 1 {
+          acc = acc + weights[0][d] * src[y][clamp_i32(x + d - reach, 0, last) * 3 + c];
         }
-        dst[y][i] = acc / n;
+        dst[y][i] = acc;
       }
     }
   }
   return;
 }
 
-// One box pass of radius `r` along each column. `n` is 2 * r + 1 as a float.
+// The same pass along each column.
 fn blur_cols(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
-src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f32) -> void {
+src : &Tensor<f32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>,
+rows : i32, cols : i32, reach : i32) -> void {
   spawn on(Topology::Device) {
     for i in 0..cols across blocks {
       for y in 0..rows across lanes(256) {
         let mut acc : f32 = 0.0;
-        for d in 0..2 * r + 1 {
-          acc = acc + src[clamp_i32(y + d - r, 0, rows - 1)][i];
+        for d in 0..2 * reach + 1 {
+          acc = acc + weights[0][d] * src[clamp_i32(y + d - reach, 0, rows - 1)][i];
         }
-        dst[y][i] = acc / n;
+        dst[y][i] = acc;
       }
     }
   }
@@ -446,12 +472,9 @@ src : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, r : i32, n : f3
 
 pub fn vxcam_blur(blurred : &mut Tensor<f32, [?, ?], Memory::HBM>,
 scratch : &mut Tensor<f32, [?, ?], Memory::HBM>, small : &Tensor<f32, [?, ?], Memory::HBM>,
-rows : i32, cols : i32, radius : i32) -> void {
-  let n = (2 * radius + 1) as f32;
-  blur_rows(scratch, small, rows, cols, radius, n);
-  blur_cols(blurred, scratch, rows, cols, radius, n);
-  blur_rows(scratch, blurred, rows, cols, radius, n);
-  blur_cols(blurred, scratch, rows, cols, radius, n);
+weights : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, radius : i32) -> void {
+  blur_rows(scratch, small, weights, rows, cols, 3 * radius);
+  blur_cols(blurred, scratch, weights, rows, cols, 3 * radius);
   return;
 }
 
