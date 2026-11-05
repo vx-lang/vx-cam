@@ -570,7 +570,7 @@ final class App: NSObject, NSApplicationDelegate {
     view.layer!.addSublayer(overlay)
     view.onKey = { [weak self] k in self?.key(k) }
     window.contentView = view
-    window.title = "vx-cam  ·  keys: m mask  l outline  b blur  f framing  1-5 device  r relearn  o overlay  space pause  q quit"
+    window.title = "vx-cam  ·  keys: m mask  e outline  b blur  f framing  1-5 device  r relearn  o overlay  space pause  q quit"
     window.center()
     window.makeKeyAndOrderFront(nil)
     window.makeFirstResponder(view)
@@ -600,7 +600,7 @@ final class App: NSObject, NSApplicationDelegate {
       guard let p = pipeline else { return }
       switch k {
       case "m": p.mode = p.mode == 1 ? 0 : 1
-      case "l": p.outline.toggle()
+      case "e": p.outline.toggle()
       case "b": p.mode = p.mode == 2 ? 0 : 2
       case "f": p.autoFraming.toggle()
       case "r":  // learn the background again from the next frame

@@ -98,7 +98,7 @@ make video CLIP=record-1.mov  # write build/outline.mov (the output with the mas
 To record a clip, use QuickTime Player (File > New Movie Recording) and save it in this
 folder. `.gitignore` keeps `*.mov` files here out of git.
 
-Keys in the window: `m` mask view, `l` outline, `b` blur off, `f` auto-framing off, `1`-`5` move a
+Keys in the window: `m` mask view, `e` outline (the mask's edge), `b` blur off, `f` auto-framing off, `1`-`5` move a
 stage between the CPU and the GPU, `r` learn the background again (stand-in only), `o` overlay,
 space pause, `q` quit.
 
