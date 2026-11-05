@@ -49,7 +49,8 @@ Each stage gives the same bits on both devices. The numbers say where each stage
 - Most of the time of a GPU stage is not GPU work. A launch takes about 0.12 ms from its commit
   to the start of the kernel, and about 0.10 ms from the end of the kernel until the waiting
   thread runs again. All on the GPU, a frame makes 10 launches, so about 2.2 ms of its 2.8 ms is
-  this wait. The kernels themselves take about 0.45 ms.
+  this wait. The kernels themselves take about 0.45 ms. One command buffer and one wait for the
+  kernels of a stage would remove most of it ([vx-lang/Vx#2781](https://github.com/vx-lang/Vx/issues/2781)).
 - The GPU changes its clock during a run. The same kernel takes about 0.04 ms at the high clock
   and 0.15 ms at the low one, and a run can switch either way, which made some runs look three
   times slower. Since the GPU sits idle for most of each launch, macOS often keeps it at the low
