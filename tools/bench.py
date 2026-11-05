@@ -4,7 +4,7 @@
     python3 tools/bench.py [--clip build/test_clip.mov] [--also record-1.mov]
                            [--tflite selfie_segmentation_landscape.tflite --python venv/bin/python]
 
-`make bench` runs it. It measures five things, on one machine at one time:
+`make bench` runs it. It measures six things, on one machine at one time:
 
 1. The same bits on both devices: every buffer of every stage, run on the CPU and on the GPU
    from the same Vx source, compared every 10 frames over the whole clip.
@@ -20,9 +20,12 @@
 5. The model against TFLite and Core ML (with --tflite): its masks against TFLite's
    (tools/check_model.py), and the time of the same model in TFLite and Core ML
    (tools/baseline_model.py). --python is a Python with ai-edge-litert, tflite and coremltools.
+6. One wait for each function: on a Vx runtime that puts the GPU launches of a function in one
+   command buffer (vx-lang/Vx#2781), segment alone on the GPU and all on the GPU, with a wait
+   after each launch (VX_METAL_SYNC=1) and without, taken in turn. An older runtime skips it.
 
-It waits until the load average is below --quiet (3 by default, up to 30 minutes) and records
-the load before and after each part. Other work on the machine shows up in the numbers.
+It waits until the load average is below --quiet (3 by default, up to 30 minutes) before each
+part and each round of placements, and records the load before and after each. Other work on the machine shows up in the numbers.
 """
 import argparse
 import datetime
@@ -52,7 +55,7 @@ p.add_argument("--vx", default=os.path.expanduser("~/go/Vx"),
                help="the Vx checkout that built vxc, if build/vx-commit.txt is missing")
 p.add_argument("--only", help="parts to run, such as 1,2 (default: all)")
 args = p.parse_args()
-parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5}
+parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5, 6}
 os.makedirs(OUT, exist_ok=True)
 BIN = os.path.join(ROOT, "build", "vx-cam")
 
@@ -124,6 +127,16 @@ def label(gpu):
     return "all CPU" if not gpu else "all GPU" if len(gpu) == 5 else "GPU: " + ", ".join(gpu)
 
 
+def summary(rs, g):
+    walls = [r["wall"] for r in rs]
+    out = {"gpu": g, "label": label(g), "wall": statistics.median(walls), "wall_min": min(walls),
+           "wall_max": max(walls), "frame": statistics.median(r["frame"] for r in rs),
+           "stages": {s: statistics.median(r["stages"][s] for r in rs) for s in STAGES}}
+    if rs and "busy" in rs[0]:
+        out["busy"] = [statistics.median(r["busy"][i] for r in rs) for i in range(2)]
+    return out
+
+
 results = {"date": datetime.datetime.now().isoformat(timespec="seconds"),
            "machine": sh("sysctl", "-n", "machdep.cpu.brand_string"), "cores": sh("sysctl", "-n", "hw.ncpu"),
            "hw": sh("sysctl", "-n", "hw.model"), "macos": platform.mac_ver()[0],
@@ -146,23 +159,17 @@ if 2 in parts or 3 in parts:
     results["load"]["placements"] = [wait_quiet()]
     seq = {name(g): [] for g in placements}
     ovl = {name(g): [] for g in placements if "composite" in g}
+    results["rounds"] = []
     for k in range(args.runs):
+        start = wait_quiet() if k else results["load"]["placements"][0]
         for g in placements:
             if 2 in parts or "composite" in g:
                 seq[name(g)].append(parse(run(",".join(g))))
             if 3 in parts and "composite" in g:
                 ovl[name(g)].append(parse(run(",".join(g), env={"VXCAM_OVERLAP": "1"})))
+        results["rounds"].append([start, load()])
         print(f"placements: run {k + 1} of {args.runs} done, load {load()}")
     results["load"]["placements"].append(load())
-
-    def summary(rs, g):
-        walls = [r["wall"] for r in rs]
-        out = {"gpu": g, "label": label(g), "wall": statistics.median(walls), "wall_min": min(walls),
-               "wall_max": max(walls), "frame": statistics.median(r["frame"] for r in rs),
-               "stages": {s: statistics.median(r["stages"][s] for r in rs) for s in STAGES}}
-        if rs and "busy" in rs[0]:
-            out["busy"] = [statistics.median(r["busy"][i] for r in rs) for i in range(2)]
-        return out
 
     results["placements"] = {name(g): summary(seq[name(g)], g) for g in placements if seq[name(g)]}
     if 3 in parts:
@@ -217,6 +224,23 @@ if 5 in parts and args.tflite:
     results["load"]["model"].append(load())
     print("part 5: model done")
 
+if 6 in parts:
+    results["load"]["waits"] = [wait_quiet()]
+    if "waited for" not in run("segment", frames=8, env={"VX_DISPATCH_VERBOSE": "1"}):
+        print("part 6: skipped, this runtime waits after each launch")
+    else:
+        cases = [(["segment"], "0"), (STAGES, "0"), (STAGES, "1")]
+        sync = {}
+        for k in range(args.runs):
+            for g, o in cases:
+                for each in "10":
+                    sync.setdefault((name(g), o, each), []).append(
+                        parse(run(",".join(g), env={"VX_METAL_SYNC": each, "VXCAM_OVERLAP": o})))
+        results["waits"] = [{"overlap": o == "1", "each_launch": summary(sync[(name(g), o, "1")], g),
+                             "one_a_function": summary(sync[(name(g), o, "0")], g)} for g, o in cases]
+        print("part 6: waits done")
+    results["load"]["waits"].append(load())
+
 json.dump(results, open(os.path.join(OUT, "results.json"), "w"), indent=1)
 
 # The report.
@@ -224,7 +248,9 @@ L = [f"# vx-cam benchmark, {results['date'][:10]}", "",
      f"{results['machine']} ({results['hw']}, {results['cores']} cores), macOS {results['macos']}. "
      f"vx-cam {results['vx_cam']}, Vx {results['vx']}. Clip: {results['clip']}, {args.frames} frames a run, "
      f"{args.runs} runs of each placement, taken in turn. Load average before and after each part: "
-     + "; ".join(f"{k} {v[0]} to {v[1]}" for k, v in results["load"].items()) + ".", ""]
+     + "; ".join(f"{k} {v[0]} to {v[1]}" for k, v in results["load"].items()) + "."
+     + (" Rounds of placements: " + ", ".join(f"{a} to {b}" for a, b in results["rounds"]) + "."
+        if results.get("rounds") else ""), ""]
 
 if "bits" in results:
     L += ["## 1. The same bits on the CPU and the GPU", "",
@@ -297,6 +323,20 @@ if "model" in results:
             L.append(f"| {what} | {r['precision']} | {r['median_ms']:.2f} |")
     elif "baseline_error" in m:
         L += ["", "Baseline failed: " + m["baseline_error"][-500:]]
+    L.append("")
+
+if "waits" in results:
+    L += ["## 6. One wait for each function", "",
+          "The GPU launches of a Vx function go into one command buffer, and the function waits for the GPU "
+          "once before it returns (vx-lang/Vx#2781). VX_METAL_SYNC=1 waits after each launch instead, as Vx "
+          "did before. Wall time a frame and the segment stage, median of the runs:", "",
+          "| Placement | Overlap | Wall, a wait each launch | Wall, one wait | Speedup "
+          "| segment, a wait each launch | segment, one wait |",
+          "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+    for w in results["waits"]:
+        a, b = w["each_launch"], w["one_a_function"]
+        L.append(f"| {a['label']} | {'yes' if w['overlap'] else 'no'} | {a['wall']:.2f} | {b['wall']:.2f} "
+                 f"| {a['wall'] / b['wall']:.2f}x | {a['stages']['segment']:.2f} | {b['stages']['segment']:.2f} |")
     L.append("")
 
 open(os.path.join(OUT, "report.md"), "w").write("\n".join(L))
