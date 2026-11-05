@@ -6,7 +6,7 @@
 // Usage:
 //   vx-cam <clip.mov>                      play the clip in a window
 //   vx-cam --camera                        run on the default camera in a window
-//   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table,
+//   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table (medians),
 //                                          and write a few frames as PNG to dir
 import AVFoundation
 import AppKit
@@ -137,6 +137,7 @@ struct StageInfo {
   let name: String
   var device = "CPU"
   var ms: Double = 0
+  var last: Double = 0
   var bytesMoved = 0
 }
 
@@ -152,6 +153,7 @@ final class Pipeline {
   /// Every stage is GPU kernels, and each can run on either device.
   var stages = ["preprocess", "segment", "smooth", "blur", "composite"].map { StageInfo(name: $0) }
   var frameMs: Double = 0
+  var lastFrameMs: Double = 0
 
   // Every buffer is shared: a stage on either device reads and writes it in place.
   let out: Shared<UInt8>
@@ -281,6 +283,7 @@ final class Pipeline {
     let t0 = DispatchTime.now().uptimeNanoseconds
     body()
     let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+    stages[i].last = ms
     stages[i].ms = frameIndex == 0 ? ms : stages[i].ms * 0.9 + ms * 0.1
   }
 
@@ -299,6 +302,7 @@ final class Pipeline {
     timed(3) { runBlur(onGPU: onGPU(3)) }
     timed(4) { runComposite(frame, stride, onGPU: onGPU(4)) }
     let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+    lastFrameMs = ms
     frameMs = frameIndex == 0 ? ms : frameMs * 0.9 + ms * 0.1
     frameIndex += 1
   }
@@ -345,9 +349,11 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   let snapshots: Set<Int> = [20, 100, 200, 300, 350]
   var buf: CVPixelBuffer? = first
   var last: CVPixelBuffer?
+  var log: [[Double]] = []  // per frame: each stage, then the whole frame
   for i in 0..<frames {
     guard let pb = buf else { break }
     p.process(pb)
+    log.append(p.stages.map { $0.last } + [p.lastFrameMs])
     last = pb
     if let dir, snapshots.contains(i) {
       writePNG(p.image(), to: "\(dir)/frame\(i).png")
@@ -358,7 +364,16 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
     }
     buf = source.next()
   }
+  // The overlay shows moving averages, which mostly reflect the last frames. The GPU changes its
+  // clock during a run, so a run reports the median of each column, and the spread of the frame.
+  let n = log.count
+  func median(_ c: Int) -> Double { log.map { $0[c] }.sorted()[n / 2] }
+  for i in p.stages.indices { p.stages[i].ms = median(i) }
+  p.frameMs = median(p.stages.count)
   print(p.table(fps: source.fps))
+  let frame = log.map { $0[p.stages.count] }.sorted()
+  print(String(format: "frame over %d frames: median %.2f ms, mean %.2f ms, slowest tenth from %.2f ms",
+               n, frame[n / 2], frame.reduce(0, +) / Double(n), frame[n * 9 / 10]))
   if let last { p.compareStages(last).forEach { print($0) } }
 }
 

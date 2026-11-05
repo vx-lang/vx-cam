@@ -19,30 +19,36 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `blur` | Separable box blur (two passes, close to a Gaussian) at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `composite` | Crop and zoom, then mix sharp person and blurred background | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
-On the M4 (10 cores), over the 360-frame test clip, the middle run of three:
+On the M4 (10 cores), the median over the 360 frames of the test clip, from the middle run of
+five, with other work on the machine:
 
 | | preprocess | segment | smooth | blur | composite | whole frame |
 | --- | --- | --- | --- | --- | --- | --- |
-| all on the CPU | 0.18 ms | 0.06 ms | 0.17 ms | 0.91 ms | 2.22 ms | 3.47 ms |
-| all on the GPU | 0.33 ms | 0.26 ms | 0.65 ms | 1.07 ms | 0.45 ms | 2.76 ms |
-| `VXCAM_GPU=blur,composite` | 0.24 ms | 0.06 ms | 0.17 ms | 1.06 ms | 0.45 ms | 1.98 ms |
+| all on the CPU | 0.19 ms | 0.07 ms | 0.17 ms | 0.87 ms | 2.19 ms | 3.56 ms |
+| all on the GPU | 0.34 ms | 0.27 ms | 0.67 ms | 1.09 ms | 0.46 ms | 2.83 ms |
+| `VXCAM_GPU=blur,composite` | 0.24 ms | 0.06 ms | 0.17 ms | 1.16 ms | 0.48 ms | 2.10 ms |
 
 Each stage gives the same bits on both devices. The numbers say where each stage belongs:
 
-- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.45 ms,
-  against 2.22 ms on all ten cores.
+- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.46 ms,
+  against 2.19 ms on all ten cores.
 - The other stages work at 1/4 size. Each GPU launch waits for the GPU to finish, so a small
   stage costs more on the GPU than on the CPU. `smooth` ends in serial work (reduce the rows
   to one box, ease the crop window), which is host code on either device.
 - `blur` is close. On the CPU it is faster, but then `composite` is the only GPU launch of the
-  frame and takes 0.78 ms rather than 0.50 ms. Moving both to the GPU gives the fastest
-  frame, by a little.
+  frame and takes 0.81 ms rather than 0.48 ms. The two placements tie at 2.1 ms a frame.
 - The CPU copy of a kernel shares its blocks among the cores
   ([vx-lang/Vx#2649](https://github.com/vx-lang/Vx/issues/2649)). Before that it ran on one
   thread, and `composite` on the CPU took 10.6 ms.
-- On an idle machine, some runs with stages on the GPU take about three times as long in every
-  GPU stage (about 9 ms for all on the GPU). The table shows the usual runs. The cause is not
-  known yet.
+- Most of the time of a GPU stage is not GPU work. A launch takes about 0.12 ms from its commit
+  to the start of the kernel, and about 0.10 ms from the end of the kernel until the waiting
+  thread runs again. All on the GPU, a frame makes 10 launches, so about 2.2 ms of its 2.8 ms is
+  this wait. The kernels themselves take about 0.45 ms.
+- The GPU changes its clock during a run. The same kernel takes about 0.04 ms at the high clock
+  and 0.15 ms at the low one, and a run can switch either way, which made some runs look three
+  times slower. Since the GPU sits idle for most of each launch, macOS often keeps it at the low
+  clock. `--headless` reports the median of each stage, so that one switch does not decide the
+  numbers. The overlay shows a moving average.
 
 The stand-in segmentation needs a still background and a person who moves, which is what the
 test clip shows. With the camera, step out of view, press `r` so it learns the empty room, and
