@@ -21,14 +21,16 @@ CLIP ?= build/test_clip.mov
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
-build/vxcam.o: pipeline/vxcam.vx | build
+# vxcam.o depends on vxc and the runtime too: an object from an older vxc may not match a newer
+# runtime (since vx-lang/Vx#2781, a pub fn waits for the GPU before it returns).
+build/vxcam.o: pipeline/vxcam.vx $(VXC) $(DISPATCH) | build
 	cd $(VX) && . $(VX_CONFIG) && $(VXC) $(CURDIR)/$< --host default --machine fleet/m4-uma.vx \
 	  -O3 --action emit-obj -o $(CURDIR)/$@ 2>&1 | grep -v "W1029\|dynamic shape\|run-time extent" || true
 	test -f $@
 
 # Info.plist goes into the binary, so macOS can ask for the camera with its reason.
 # build/vx-commit.txt records the Vx commit, for make bench.
-build/vx-cam: shell/main.swift shell/Info.plist pipeline/vxcam.h build/vxcam.o
+build/vx-cam: shell/main.swift shell/Info.plist pipeline/vxcam.h build/vxcam.o $(DISPATCH)
 	swiftc -O -import-objc-header pipeline/vxcam.h shell/main.swift build/vxcam.o $(LIBS) \
 	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker shell/Info.plist -o $@
 	git -C $(VX) log -1 --format='%h %cs %s' > build/vx-commit.txt

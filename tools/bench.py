@@ -11,8 +11,8 @@
 2. Every placement: each of the 32 ways to put the five stages on the CPU or the GPU, run
    --runs times in turn (so a slow spell of the machine or a change of the GPU's clock falls on
    all of them alike). Each run reports the median of each stage and the wall time a frame.
-3. The CPU and the GPU at the same time: each placement with composite on the GPU, run with
-   frames overlapping (VXCAM_OVERLAP=1) and without, and the output hashes of the two compared.
+3. The CPU and the GPU at the same time: each placement run with frames overlapping
+   (VXCAM_OVERLAP=1) and without, and the output hashes of the two compared.
 4. Handoffs and launches: the Vx runtime logs each kernel it launches, each wait for the GPU
    with the GPU's time, and each tensor it had to copy. With each stage alone on the GPU, this
    counts the launches, waits and copies a frame, and the GPU's busy time against the stage's
@@ -109,7 +109,7 @@ def parse(text):
             r["frame"] = float(m.group(1))
         if m := re.match(r"^wall: ([\d.]+) ms a frame", line):
             r["wall"] = float(m.group(1))
-        if m := re.match(r"^overlap: the CPU thread is busy (\d+)% of the time, the GPU thread (\d+)%", line):
+        if m := re.match(r"^overlap: the (?:CPU|first) thread is busy (\d+)% of the time, the (?:GPU|second) thread (\d+)%", line):
             r["busy"] = [int(m.group(1)), int(m.group(2))]
         if m := re.match(r"^output hash: (\w+)", line):
             r["hash"] = m.group(1)
@@ -158,14 +158,13 @@ if 1 in parts:
 if 2 in parts or 3 in parts:
     results["load"]["placements"] = [wait_quiet()]
     seq = {name(g): [] for g in placements}
-    ovl = {name(g): [] for g in placements if "composite" in g}
+    ovl = {name(g): [] for g in placements}
     results["rounds"] = []
     for k in range(args.runs):
         start = wait_quiet() if k else results["load"]["placements"][0]
         for g in placements:
-            if 2 in parts or "composite" in g:
-                seq[name(g)].append(parse(run(",".join(g))))
-            if 3 in parts and "composite" in g:
+            seq[name(g)].append(parse(run(",".join(g))))
+            if 3 in parts:
                 ovl[name(g)].append(parse(run(",".join(g), env={"VXCAM_OVERLAP": "1"})))
         results["rounds"].append([start, load()])
         print(f"placements: run {k + 1} of {args.runs} done, load {load()}")
@@ -175,8 +174,6 @@ if 2 in parts or 3 in parts:
     if 3 in parts:
         results["overlap"] = {}
         for g in placements:
-            if "composite" not in g:
-                continue
             n = name(g)
             hashes = [parse(run(",".join(g), env={"VXCAM_HASH": "1", "VXCAM_OVERLAP": o}))["hash"] for o in "01"]
             results["overlap"][n] = {**summary(ovl[n], g), "one_after_another": results["placements"][n]["wall"],
@@ -282,10 +279,12 @@ if "overlap" in results:
     ov = sorted(results["overlap"].values(), key=lambda r: r["wall"])
     L += ["## 3. The CPU and the GPU at the same time", "",
           "With frames overlapping, one thread runs the first stages of the next frame while a second runs "
-          "the GPU stages of this one. Wall time a frame:", "",
-          "| Placement | One after another | Overlapping | Speedup | CPU thread busy | GPU thread busy | Same output |",
+          "the last ones of this frame: composite, and blur when it is on composite's device. Wall time a "
+          "frame, the 8 fastest and the single devices:", "",
+          "| Placement | One after another | Overlapping | Speedup | First thread busy | Second thread busy "
+          "| Same output |",
           "| --- | ---: | ---: | ---: | ---: | ---: | --- |"]
-    for r in ov[:8]:
+    for r in ov[:8] + [r for r in ov[8:] if r["label"] in ("all CPU", "all GPU", "GPU: segment")]:
         L.append(f"| {r['label']} | {r['one_after_another']:.2f} | {r['wall']:.2f} | "
                  f"{r['one_after_another'] / r['wall']:.2f}x | {r['busy'][0]:.0f}% | {r['busy'][1]:.0f}% | "
                  f"{'yes' if r['same_output'] else 'NO'} |")

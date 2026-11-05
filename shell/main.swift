@@ -375,7 +375,7 @@ final class Pipeline {
   }
   private var recorded = 0
   /// Set while runOverlapped runs: the stages on each of its two threads, for the panel.
-  var lanes: (cpu: [Int], gpu: [Int])?
+  var lanes: (front: [Int], back: [Int])?
 
   /// Runs the five stages on `pb` one after another, in slot 0.
   func process(_ pb: CVPixelBuffer) {
@@ -430,19 +430,20 @@ func hashOutput(_ p: Pipeline, into digest: inout UInt64) {
   for i in 0..<(p.w * p.h * 4 / 8) { digest = (digest ^ words[i]) &* 0x100000001b3 }
 }
 
-/// Runs up to `frames` frames of `source` on two threads, so that the CPU and the GPU work at
-/// the same time. The calling thread runs the first stages of frame i while a second thread
-/// runs the last ones, which are on the GPU, for frame i - 1: composite, and blur too when it is
-/// on the GPU. Each of the two frames in flight has its own slot of buffers (Pipeline.smalls and
+/// Runs up to `frames` frames of `source` on two threads, so that the CPU and the GPU can work
+/// at the same time. The calling thread runs the first stages of frame i while a second thread
+/// runs the last ones for frame i - 1: composite, and blur too when it is on the same device as
+/// composite. Each stage runs on its own device (VXCAM_GPU), so with the model on the GPU and
+/// composite on the CPU, the GPU segments one frame while the CPU composites the one before.
+/// Each of the two frames in flight has its own slot of buffers (Pipeline.smalls and
 /// the rest), so a thread waits only to take a slot that the other has finished with. A frame
 /// comes out one frame later than it would one stage after another. `after(times, pb, time)` runs
 /// on the second thread after each frame, in order, with the frame's time in the clip. Returns the
 /// wall time and each thread's busy time, in ms.
 func runOverlapped(_ p: Pipeline, _ source: VideoSource, frames: Int,
-                   after: @escaping ([Double], CVPixelBuffer, CMTime) -> Void) -> (wall: Double, cpu: Double, gpu: Double) {
+                   after: @escaping ([Double], CVPixelBuffer, CMTime) -> Void) -> (wall: Double, front: Double, back: Double) {
   let onGPU = p.stages.map { $0.device == "GPU" }
-  guard onGPU[4] else { fatalError("frames overlap only with composite on the GPU (VXCAM_GPU)") }
-  let back = onGPU[3] ? [3, 4] : [4]
+  let back = onGPU[3] == onGPU[4] ? [3, 4] : [4]
   let front = p.stages.indices.filter { !back.contains($0) }
   p.lanes = (front, back)
   final class Hand { var frame: (pb: CVPixelBuffer, times: [Double], time: CMTime)? }
@@ -463,7 +464,7 @@ func runOverlapped(_ p: Pipeline, _ source: VideoSource, frames: Int,
       let pb = item.pb
       var times = item.times
       let t0 = nowMs()
-      for k in back { times[k] = p.runStage(k, pb, onGPU: true, slot: s) }
+      for k in back { times[k] = p.runStage(k, pb, onGPU: onGPU[k], slot: s) }
       backBusy += nowMs() - t0
       after(times, pb, item.time)
       hands[s].frame = nil
@@ -519,7 +520,7 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   let warmup = min(10, frames / 4)
   var last: CVPixelBuffer?
   var log: [[Double]] = []  // per frame: each stage, then the whole frame
-  var wall = 0.0, busy: (cpu: Double, gpu: Double)?
+  var wall = 0.0, busy: (front: Double, back: Double)?
   var wallStart = 0.0
   for i in 0..<(overlap ? warmup : frames) {
     if i == warmup { wallStart = nowMs() }
@@ -544,7 +545,7 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
       if hashing { hashOutput(p, into: &digest) }
       last = pb
     }
-    wall = r.wall; busy = (r.cpu, r.gpu)
+    wall = r.wall; busy = (r.front, r.back)
   } else {
     wall = nowMs() - wallStart
   }
@@ -562,8 +563,8 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   print(String(format: "wall: %.2f ms a frame over %d frames, %.1f frames a second%@", wall / Double(timed), timed,
                1000 * Double(timed) / wall, overlap ? " (frames overlap)" : ""))
   if let busy {
-    print(String(format: "overlap: the CPU thread is busy %.0f%% of the time, the GPU thread %.0f%%",
-                 100 * busy.cpu / wall, 100 * busy.gpu / wall))
+    print(String(format: "overlap: the first thread is busy %.0f%% of the time, the second thread %.0f%%",
+                 100 * busy.front / wall, 100 * busy.back / wall))
   }
   if hashing { print(String(format: "output hash: %016llx over %d frames", digest, n)) }
   if compareEvery < 0, let last { tally(last) }
@@ -681,7 +682,7 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   // One after another, the stages of a frame run in turn, and the CPU waits for each GPU stage.
   // With frames overlapping, the two lanes run at the same time: the first stages of the next
   // frame, and the last ones of this frame. Either way the buffers pass over in place.
-  let lanes = p.lanes.map { [("next frame", $0.cpu), ("this frame", $0.gpu)] } ?? [("", Array(p.stages.indices))]
+  let lanes = p.lanes.map { [("next frame", $0.front), ("this frame", $0.back)] } ?? [("", Array(p.stages.indices))]
   let laneX = p.lanes == nil ? x0 : x0 + 104, laneW = strip - (laneX - x0)
   ctx.setStrokeColor(dim)
   for (label, stages) in lanes {
