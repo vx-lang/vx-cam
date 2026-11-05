@@ -19,40 +19,47 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `blur` | Separable Gaussian blur at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size. It can draw a green line where the mask crosses 0.5 | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
-On the M4 (10 cores), with Vx at 9f2e6b96, which has
-[vx-lang/Vx#2812](https://github.com/vx-lang/Vx/pull/2812) and
-[#2816](https://github.com/vx-lang/Vx/pull/2816) (open on 2026-11-05). Each row is the median of
-five runs over the 360 frames of the test clip, with the 32 placements taken in turn
+On a MacBook Air with an M4 (10 cores), with Vx at a68d5641: Vx main, plus
+[vx-lang/Vx#2841](https://github.com/vx-lang/Vx/pull/2841) (open on 2026-11-05). Each row is the
+median of five runs over the 360 frames of the test clip, with the runs taken in turn
 (`make bench`, [below](#measurements)):
 
 | | preprocess | segment | smooth | blur | composite | wall time a frame |
 | --- | --- | --- | --- | --- | --- | --- |
-| all on the CPU | 0.19 ms | 7.08 ms | 1.14 ms | 0.98 ms | 3.14 ms | 12.84 ms |
-| `VXCAM_GPU=segment,smooth,blur,composite` | 0.22 ms | 6.67 ms | 0.94 ms | 0.49 ms | 0.52 ms | 8.97 ms |
-| all on the GPU | 0.33 ms | 6.59 ms | 0.93 ms | 0.49 ms | 0.50 ms | 8.87 ms |
+| all on the CPU | 0.18 ms | 7.30 ms | 1.25 ms | 0.97 ms | 2.66 ms | 12.60 ms |
+| `VXCAM_GPU=segment,smooth,blur,composite` | 0.21 ms | 6.86 ms | 0.96 ms | 0.50 ms | 0.52 ms | 9.22 ms |
+| all on the GPU | 0.33 ms | 6.64 ms | 0.93 ms | 0.49 ms | 0.51 ms | 9.01 ms |
+| all on the GPU, `VXCAM_OVERLAP=1` | | | | | | 8.01 ms |
+| `VXCAM_ALTERNATE=1`: the model on the GPU and the CPU, the rest on the CPU | GPU and CPU | GPU and CPU | CPU | CPU | CPU | 7.06 ms |
 
 Each stage gives the same bits on both devices. The numbers say where each stage belongs:
 
-- All on the GPU is the fastest of the 32 placements: 8.87 ms a frame (113 frames a second),
-  a quarter of the 33 ms budget. All on the CPU takes 12.84 ms.
-- `segment` takes about the same on either device: 6.6 ms on the GPU, 7.1 ms on ten cores. The
+- The fastest is the model on both devices at once. With `VXCAM_ALTERNATE=1`, the GPU runs it
+  for the even frames while the CPU runs it for the odd ones, and smooth, blur and composite run
+  on the CPU: 7.06 ms a frame (142 frames a second), 1.28x as fast as all on the GPU in the same
+  runs. The output is the same to the bit as all on the CPU.
+- With each stage on one device, all on the GPU is the fastest of the 32 placements: 9.01 ms a
+  frame (111 frames a second). All on the CPU takes 12.60 ms.
+- `segment` takes about the same on either device: 6.6 ms on the GPU, 7.3 ms on ten cores. The
   model is 58 kernels a frame. The GPU runs them from one command buffer, and the function
   waits for the GPU once, before it returns. When each launch waited for the GPU, `segment`
-  took 19.4 ms on the GPU (`VX_METAL_SYNC=1` still works that way).
-- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.50 ms against
-  3.14 ms on ten cores.
+  took 20.2 ms on the GPU (`VX_METAL_SYNC=1` still works that way).
+- `composite` makes every pixel of the 1280x720 output and belongs on the GPU: 0.51 ms against
+  2.66 ms on ten cores. But with the model on both devices, the GPU sets the pace, so the
+  fastest setup moves composite, smooth and blur to the CPU.
 - The other stages work at 1/4 size and take about a millisecond or less on either device.
   `smooth` ends in serial work (reduce the rows to one box, ease the crop window), which is
   host code on either device.
 - The CPU copy of a kernel shares its blocks among the cores
   ([vx-lang/Vx#2649](https://github.com/vx-lang/Vx/issues/2649)). Before that it ran on one
   thread, and `composite` on the CPU took 10.6 ms.
-- The GPU now stays busy, about 7.1 ms of each 8.9 ms frame all on the GPU, and its five runs
-  took 8.86 to 9.03 ms. When each launch waited, the GPU sat idle for most of each launch, macOS
+- The GPU now stays busy, about 7.3 ms of each 9.0 ms frame all on the GPU, and its five runs
+  took 8.99 to 9.16 ms. When each launch waited, the GPU sat idle for most of each launch, macOS
   often kept it at its low clock, and all on the GPU took 25 ms at the high clock and 44 ms at
   the low one.
-- With Vx main from before #2812 and #2816, vx-cam builds and gives the same bits. Only the
-  GPU is slower: all on the GPU takes about 23 to 25 ms.
+- With Vx from before [#2812](https://github.com/vx-lang/Vx/pull/2812) and
+  [#2816](https://github.com/vx-lang/Vx/pull/2816) (merged on 2026-11-05), vx-cam builds and gives
+  the same bits. Only the GPU is slower: all on the GPU takes about 23 to 25 ms.
 
 The segmentation model is MediaPipe Selfie Segmentation, the landscape version (Google, Apache
 License 2.0; see [models/README.md](models/README.md)). It is written in Vx as 58 kernel launches
@@ -72,9 +79,10 @@ learns the empty room, and step back in.
 ## Measurements
 
 `make bench` ([`tools/bench.py`](tools/bench.py)) measures what this README claims and writes
-`build/bench/report.md` and `results.json`. The numbers here are from three runs of it on
-2026-11-05, on the M4 with Vx 9f2e6b96. The load average was 3 to 6, with other sessions' builds
-and `syspolicyd` taking about two cores, so a quiet machine may be a little faster.
+`build/bench/report.md` and `results.json`. The numbers here are from one run of it on
+2026-11-05, on the MacBook Air (M4) with Vx a68d5641 (main plus #2841), on AC power. The load
+average was 2.8 to 4 (up to 6 in the last part), with other sessions' work and `syspolicyd`
+taking about two cores, so a quiet machine may be a little faster.
 
 **One source, the same bits.** Every buffer of every stage, run on the CPU and on the GPU and
 compared every 10 frames: 0 of 559,891,584 values differ on the test clip, and 0 of 559,891,584
@@ -83,18 +91,18 @@ on a recording from the laptop's camera.
 **The same output, however the work is placed or scheduled.** The FNV-1a hash of every output
 frame of the test clip is `27a1987a9bce448d` for all 32 placements, with frames one after
 another and with frames overlapping. It is the same again with the model alternating between
-the GPU and the CPU.
+the GPU and the CPU, for each of the 8 placements of the stages after it.
 
 **No copies.** Each stage alone on the GPU, counted from the Vx runtime's own log
 (`VX_DISPATCH_VERBOSE=1`):
 
 | Stage | Kernels a frame | Waits a frame | GPU busy a frame | Stage time on the GPU | Tensors copied |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| preprocess | 1 | 1 | 0.14 ms | 0.65 ms | 0 |
-| segment | 58 | 1 | 4.83 ms | 6.76 ms | 0 |
-| smooth | 7 | 2 | 0.78 ms | 2.01 ms | 0 |
-| blur | 2 | 1 | 0.69 ms | 1.28 ms | 0 |
-| composite | 1 | 1 | 0.66 ms | 1.31 ms | 0 |
+| preprocess | 1 | 1 | 0.19 ms | 0.90 ms | 0 |
+| segment | 58 | 1 | 4.91 ms | 6.91 ms | 0 |
+| smooth | 7 | 2 | 0.79 ms | 2.30 ms | 0 |
+| blur | 2 | 1 | 0.69 ms | 1.44 ms | 0 |
+| composite | 1 | 1 | 0.68 ms | 1.50 ms | 0 |
 
 The rest of a stage's time on the GPU is waiting for the GPU, and the host code of `smooth`.
 
@@ -103,25 +111,44 @@ launch, as Vx did before #2816) and without, taken in turn:
 
 | Placement | A wait each launch | One wait a function | Speedup |
 | --- | ---: | ---: | ---: |
-| `VXCAM_GPU=segment` | 24.99 ms | 11.56 ms | 2.16x |
-| all on the GPU | 22.95 ms | 8.88 ms | 2.58x |
+| `VXCAM_GPU=segment` | 25.83 ms | 11.93 ms | 2.17x |
+| all on the GPU | 23.79 ms | 8.98 ms | 2.65x |
+| all on the GPU, frames overlapping | 22.49 ms | 8.00 ms | 2.81x |
 
 **The CPU and the GPU at the same time.** Two modes run stages of different frames at once, on
 two or three threads:
 
 - `VXCAM_OVERLAP=1`: one thread runs the first stages of the next frame while a second runs
-  composite (and blur, when it is on composite's device) for this one. At best it is 1.05x:
-  8.55 ms against 8.97 ms with segment, smooth, blur and composite on the GPU.
+  composite (and blur, when it is on composite's device) for this one. All on the GPU, it takes
+  8.01 ms against 9.01 ms (1.12x), the fastest of the 32 placements with overlap. Placements that
+  split the stages gain more, such as blur and composite on the GPU: 9.18 ms against 11.58 ms
+  (1.26x). One loses: segment alone on the GPU, 18.37 ms against 12.11 ms.
 - `VXCAM_ALTERNATE=1`: the model runs on the GPU for the even frames and on the CPU for the odd
-  ones, on two threads, while a third runs smooth, blur and composite on each frame in order. It
-  takes 9.19 ms, against 8.91 ms all on the GPU. The output is the same to the bit, because the
-  two devices compute the same bits.
+  ones, on two threads, while a third runs smooth, blur and composite on each frame in order. The
+  output is the same to the bit, because the two devices compute the same bits. In the same
+  runs, three of the 8 placements of the stages after the model (the fastest, the slowest, and
+  all of them on the GPU), against all on the GPU:
 
-Neither mode pays yet. Today a wait on one thread waits for the other thread's GPU work, and
-holds the runtime's lock while it waits ([vx-lang/Vx#2825](https://github.com/vx-lang/Vx/issues/2825)).
-So with the model alternating, preprocess and segment take 9.3 ms on the GPU and 18.2 ms on the
-CPU, against 6.9 and 7.3 ms in a frame run one stage after another. With the model on the GPU
-and composite on the CPU, overlap makes the frame slower: 21.7 ms against 11.9 ms.
+| Placement | Mode | Wall time a frame |
+| --- | --- | ---: |
+| the model on both devices, the rest on the CPU | the model alternates | 7.06 ms |
+| all on the GPU | frames overlap | 8.36 ms |
+| the model on both devices, the rest on the GPU | the model alternates | 8.70 ms |
+| all on the GPU | one after another | 9.06 ms |
+| the model on both devices, composite on the GPU | the model alternates | 10.66 ms |
+
+Both modes need [vx-lang/Vx#2841](https://github.com/vx-lang/Vx/pull/2841): each thread has its own
+command buffer, and a wait waits only for the GPU work on its memory. Without it, a wait on one
+thread waited for the other thread's GPU work while it held the runtime's lock
+([#2825](https://github.com/vx-lang/Vx/issues/2825)), and neither mode paid: overlap was 1.05x at
+best, and the model alternating took 9.19 ms against 8.91 ms.
+
+What holds the model back now is power. The MacBook Air has no fan, and its CPU and GPU share a
+power budget. Metal's own timing of the model's 58 kernels on the GPU is 5.06 ms when the CPU is
+idle, 10.31 ms while six `yes` processes keep the CPU busy (with almost no memory traffic), and
+11.86 ms beside a CPU run of vx-cam. So with the model alternating, preprocess and segment take
+13.2 ms on the GPU and 10.6 ms on the CPU, against 7.0 and 7.5 ms one stage after another, and
+the GPU's model thread is busy 99% of the time. A Mac with more power to spare may gain more; that is untested.
 
 **The model against TFLite and Core ML.** The mask of Vx's model matches TFLite's to within 3e-5
 on the test clip and 6e-5 on the camera recording. The same model a frame, median
@@ -129,16 +156,17 @@ on the test clip and 6e-5 on the camera recording. The same model a frame, media
 
 | Implementation | Precision | Time |
 | --- | --- | ---: |
-| Vx on the CPU, ten cores (the `segment` stage, with resizing in and out) | fp32 | 6.78 ms |
-| Vx on the GPU (the same) | fp32 | 6.76 ms |
-| TFLite with XNNPACK, 1 thread | fp32 | 0.87 ms |
-| TFLite with XNNPACK, 10 threads | fp32 | 1.42 ms |
-| Core ML, CPU only | fp32 | 0.84 ms |
-| Core ML, CPU and GPU | fp32 | 2.93 ms |
-| Core ML, CPU and Neural Engine | fp16 | 0.19 ms |
+| Vx on the CPU, ten cores (the `segment` stage, with resizing in and out) | fp32 | 7.30 ms |
+| Vx on the GPU (the same) | fp32 | 6.91 ms |
+| TFLite with XNNPACK, 1 thread | fp32 | 0.84 ms |
+| TFLite with XNNPACK, 10 threads | fp32 | 1.40 ms |
+| Core ML, CPU only | fp32 | 0.81 ms |
+| Core ML, CPU and GPU | fp32 | 1.18 ms |
+| Core ML, CPU and Neural Engine | fp16 | 0.20 ms |
 
-Vx's model is about 8x slower than TFLite and Core ML on the CPU, and 2.3x slower than Core ML
-on the GPU. Its kernels are plain loops, one kernel for each layer, written so that both
+Vx's model is about 9x slower than TFLite and Core ML on the CPU, and 2.4x to 6x slower than
+Core ML on the GPU: Core ML on the GPU varies from run to run, 0.90 to 2.69 ms in this run and a
+median of 2.93 ms in the run before. Its kernels are plain loops, one kernel for each layer, written so that both
 devices compute the same bits. The vendor libraries use kernels tuned for each device, and the
 devices do not agree. On the camera recording, in fp32, Core ML's mask differs from TFLite's by
 up to 4.0e-5 on the CPU and 7.3e-5 on the GPU, so its CPU and GPU masks are not the same as each
@@ -154,10 +182,11 @@ Needs macOS on Apple Silicon, the Swift toolchain (Command Line Tools), and a Vx
 merged ([vx-lang/Vx#2747](https://github.com/vx-lang/Vx/pull/2747) to
 [#2751](https://github.com/vx-lang/Vx/pull/2751)), with `on Topology::Any`
 ([#2731](https://github.com/vx-lang/Vx/pull/2731)). The Makefile looks for it in `~/go/Vx`. Set
-`VX=/path/to/Vx` (and `VX_CONFIG`) if it is elsewhere. The numbers above need
-[#2812](https://github.com/vx-lang/Vx/pull/2812) and [#2816](https://github.com/vx-lang/Vx/pull/2816)
-as well. The build writes the Vx commit to `build/vx-commit.txt`, and recompiles the pipeline
-when `vxc` or the runtime changes.
+`VX=/path/to/Vx` (and `VX_CONFIG`) if it is elsewhere. The numbers above need Vx main from
+later on 2026-11-05 ([#2812](https://github.com/vx-lang/Vx/pull/2812) and
+[#2816](https://github.com/vx-lang/Vx/pull/2816)), and for the two modes that run frames at once,
+[#2841](https://github.com/vx-lang/Vx/pull/2841) as well. The build writes the Vx commit to
+`build/vx-commit.txt`, and recompiles the pipeline when `vxc` or the runtime changes.
 
 ```sh
 make run      # build, write the test clip, and play it in a window
@@ -168,7 +197,9 @@ make check    # run the whole clip on the CPU, then with the kernels on the GPU;
 make run CLIP=record-1.mov    # the same with your own recording (1280x720, landscape)
 make video CLIP=record-1.mov  # write build/outline.mov (the output with the mask's outline) and
                               # build/mask.mov (the mask view), each with a panel of where
-                              # each stage runs and how long it takes
+                              # each stage runs and how long it takes; by default the model
+                              # alternates between the GPU and the CPU (VIDEO_GPU=,
+                              # VIDEO_ALTERNATE=1; see the Makefile)
 make bench    # the measurements above, in build/bench/report.md (about an hour; see
               # tools/bench.py for TFLITE=, BENCH_PYTHON= and BENCH_ALSO=)
 ```
@@ -204,7 +235,7 @@ space pause, `q` quit.
 | `models/` | The segmentation model's weights, its license and where it comes from |
 | `tools/convert_model.py` | Writes those weights from Google's .tflite file |
 | `tools/check_model.py` | Compares vx-cam's mask with TFLite's, on the frames that `--headless` writes |
-| `tools/bench.py` | `make bench`: bits, placements, overlap, launches and copies, the model against TFLite and Core ML |
+| `tools/bench.py` | `make bench`: bits, placements, overlap, launches and copies, the model against TFLite and Core ML, the model on both devices |
 | `tools/baseline_model.py` | Times the model in TFLite and Core ML, and checks their masks against TFLite's |
 | `tools/coreml_model.py` | Builds the Core ML model from the .tflite file, layer by layer |
 
@@ -229,7 +260,8 @@ Every buffer is page-aligned host memory. On unified memory, the runtime gives t
 pages to the GPU as they are, so the handoff between a CPU stage and a GPU stage copies
 nothing. The only cost is the wait for the GPU. Since vx-lang/Vx#2816, the GPU launches of a
 function share one command buffer, and the function waits once, before it returns. Before, each
-launch waited.
+launch waited. With #2841, each thread has its own command buffer, and a wait covers only the
+launches that use its memory, so two threads can keep the GPU and the CPU busy at once.
 
 A tensor crosses into Vx as 7 C arguments per rank-2 tensor (`VXCAM_TENSOR2` in
 `pipeline/vxcam.h`). Vx needs a packed tensor, one whose row stride is its row length, and

@@ -51,13 +51,15 @@ run: all
 # Writes two movies of the clip, without a window, every frame once: build/outline.mov, the
 # output (background blurred, auto-framing) with a green line where the mask's edge is, and
 # build/mask.mov, the mask view with the same line. A panel shows where each stage runs and
-# how long it takes. VIDEO_GPU names the stages on the GPU; the default was the fastest in make
-# bench. With VIDEO_OVERLAP=1, one thread starts the next frame while a second finishes this one,
-# and the panel shows the two lanes. With VIDEO_ALTERNATE=1, the model runs on the GPU for even
-# frames and on the CPU for odd ones, at the same time, and the panel shows both.
-VIDEO_GPU ?= segment,smooth,blur,composite
-VIDEO_OVERLAP ?= 1
-VIDEO_ALTERNATE ?= 0
+# how long it takes. VIDEO_GPU names the stages on the GPU. With VIDEO_OVERLAP=1, one thread
+# starts the next frame while a second finishes this one, and the panel shows the two lanes. With
+# VIDEO_ALTERNATE=1, the model runs on the GPU for even frames and on the CPU for odd ones, at the
+# same time, and the panel shows both. The default, the model alternating with the other stages
+# on the CPU, was the fastest in make bench. Writing the movie takes CPU time too, so the panel's
+# times are slower than make bench's.
+VIDEO_GPU ?=
+VIDEO_OVERLAP ?= 0
+VIDEO_ALTERNATE ?= 1
 VIDEO_ENV = VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) VXCAM_ALTERNATE=$(VIDEO_ALTERNATE)
 video: all
 	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
