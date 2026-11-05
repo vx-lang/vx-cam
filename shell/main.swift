@@ -8,6 +8,7 @@
 //   vx-cam --camera                        run on the default camera in a window
 //   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table (medians),
 //                                          and write a few frames as PNG to dir
+//   vx-cam <clip.mov> --write out.mov      run every frame once and write the output to out.mov
 import AVFoundation
 import AppKit
 import CoreVideo
@@ -28,6 +29,9 @@ final class VideoSource: FrameSource {
   private var reader: AVAssetReader?
   private var output: AVAssetReaderTrackOutput?
   private(set) var fps: Double = 30
+  /// The time of the last frame that `next` returned. With `loops` false, `next` ends at the end.
+  private(set) var time = CMTime.zero
+  var loops = true
   private var timer: DispatchSourceTimer?
 
   init(url: URL) { self.url = url; open() }
@@ -67,8 +71,10 @@ final class VideoSource: FrameSource {
   func next() -> CVPixelBuffer? {
     for _ in 0..<2 {
       if let sample = output?.copyNextSampleBuffer(), let buf = CMSampleBufferGetImageBuffer(sample) {
+        time = CMSampleBufferGetPresentationTimeStamp(sample)
         return buf
       }
+      if !loops { return nil }
       reader?.cancelReading()
       open()
     }
@@ -409,6 +415,50 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   if let last { p.compareStages(last).forEach { print($0) } }
 }
 
+/// Runs every frame of the clip once and writes the output frames to a movie, at their times.
+func runWrite(source: VideoSource, to path: String) {
+  source.loops = false
+  guard let first = source.next() else { fatalError("the clip has no frames") }
+  let (w, h) = (CVPixelBufferGetWidth(first), CVPixelBufferGetHeight(first))
+  let p = Pipeline(w: w, h: h)
+  let url = URL(fileURLWithPath: path)
+  try? FileManager.default.removeItem(at: url)
+  guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { fatalError("cannot write \(path)") }
+  let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+    AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
+    AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000],
+  ])
+  let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+    kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
+  ])
+  writer.add(input)
+  writer.startWriting()
+  writer.startSession(atSourceTime: source.time)
+  var buf: CVPixelBuffer? = first
+  var n = 0
+  while let pb = buf {
+    p.process(pb)
+    var frame: CVPixelBuffer?
+    CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &frame)
+    guard let frame else { fatalError("no buffer to write frame \(n) into") }
+    CVPixelBufferLockBaseAddress(frame, [])
+    let dst = CVPixelBufferGetBaseAddress(frame)!, rowBytes = CVPixelBufferGetBytesPerRow(frame)
+    for y in 0..<h { memcpy(dst + y * rowBytes, p.out.ptr + y * w * 4, w * 4) }
+    CVPixelBufferUnlockBaseAddress(frame, [])
+    while !input.isReadyForMoreMediaData { usleep(1000) }
+    adaptor.append(frame, withPresentationTime: source.time)
+    n += 1
+    buf = source.next()
+  }
+  input.markAsFinished()
+  let done = DispatchSemaphore(value: 0)
+  writer.finishWriting { done.signal() }
+  done.wait()
+  guard writer.status == .completed else { fatalError("writing \(path) failed: \(String(describing: writer.error))") }
+  print("wrote \(n) frames to \(path)")
+}
+
 // MARK: - Window
 
 final class View: NSView {
@@ -500,7 +550,7 @@ final class App: NSObject, NSApplicationDelegate {
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-  print("usage: vx-cam <clip.mov> [--headless N [dir]]  |  vx-cam --camera")
+  print("usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov]  |  vx-cam --camera")
   exit(2)
 }
 let source: FrameSource
@@ -510,6 +560,10 @@ if args[1] == "--camera" {
   let clip = VideoSource(url: URL(fileURLWithPath: args[1]))
   if args.count >= 4 && args[2] == "--headless" {
     runHeadless(source: clip, frames: Int(args[3]) ?? 100, dir: args.count >= 5 ? args[4] : nil)
+    exit(0)
+  }
+  if args.count >= 4 && args[2] == "--write" {
+    runWrite(source: clip, to: args[3])
     exit(0)
   }
   source = clip

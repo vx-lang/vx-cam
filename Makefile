@@ -17,7 +17,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 # folder (*.mov) stay out of git.
 CLIP ?= build/test_clip.mov
 
-.PHONY: all run camera check clean
+.PHONY: all run video camera check clean
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
@@ -43,6 +43,11 @@ build/test_clip.mov: build/make_test_clip
 
 run: all
 	./build/vx-cam $(CLIP)
+
+# Writes the clip with the background blurred and the auto-framing to build/out.mov, without a
+# window. Every frame runs once.
+video: all
+	./build/vx-cam $(CLIP) --write build/out.mov
 
 # The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
 # of view and press r, so the stand-in learns the empty room, then step back in.

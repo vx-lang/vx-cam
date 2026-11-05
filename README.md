@@ -90,6 +90,7 @@ make check    # run the whole clip on the CPU, then with the kernels on the GPU;
               # stage tables, compare each GPU stage with its CPU copy bit for bit, and
               # write snapshots (output and mask view) to build/snapshots
 make run CLIP=record-1.mov    # the same with your own recording (1280x720, landscape)
+make video CLIP=record-1.mov  # write the output, blurred and framed, to build/out.mov
 ```
 
 To record a clip, use QuickTime Player (File > New Movie Recording) and save it in this
