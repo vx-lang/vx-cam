@@ -48,7 +48,8 @@ p.add_argument("--runs", type=int, default=5)
 p.add_argument("--quiet", type=float, default=3.0, help="wait for a load average below this")
 p.add_argument("--tflite", help="the original .tflite model, for part 5")
 p.add_argument("--python", default=sys.executable, help="a Python for tools/check_model.py and baseline_model.py")
-p.add_argument("--vx", default=os.path.expanduser("~/go/Vx"), help="the Vx checkout that built vxc")
+p.add_argument("--vx", default=os.path.expanduser("~/go/Vx"),
+               help="the Vx checkout that built vxc, if build/vx-commit.txt is missing")
 p.add_argument("--only", help="parts to run, such as 1,2 (default: all)")
 args = p.parse_args()
 parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5}
@@ -67,6 +68,15 @@ def git(path, *a):
 
 def sh(*a):
     return subprocess.run(a, capture_output=True, text=True).stdout.strip()
+
+
+def vx_commit():
+    # The Makefile writes the Vx commit when it links the binary, since the checkout may have
+    # moved on since then.
+    path = os.path.join(ROOT, "build", "vx-commit.txt")
+    if os.path.exists(path):
+        return open(path).read().strip()
+    return git(args.vx, "rev-parse", "--short", "HEAD")
 
 
 def wait_quiet():
@@ -117,7 +127,7 @@ def label(gpu):
 results = {"date": datetime.datetime.now().isoformat(timespec="seconds"),
            "machine": sh("sysctl", "-n", "machdep.cpu.brand_string"), "cores": sh("sysctl", "-n", "hw.ncpu"),
            "hw": sh("sysctl", "-n", "hw.model"), "macos": platform.mac_ver()[0],
-           "vx_cam": git(ROOT, "rev-parse", "--short", "HEAD"), "vx": git(args.vx, "rev-parse", "--short", "HEAD"),
+           "vx_cam": git(ROOT, "rev-parse", "--short", "HEAD"), "vx": vx_commit(),
            "clip": os.path.basename(args.clip), "frames": args.frames, "runs": args.runs, "load": {}}
 placements = [list(c) for n in range(6) for c in itertools.combinations(STAGES, n)]
 

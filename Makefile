@@ -27,9 +27,11 @@ build/vxcam.o: pipeline/vxcam.vx | build
 	test -f $@
 
 # Info.plist goes into the binary, so macOS can ask for the camera with its reason.
+# build/vx-commit.txt records the Vx commit, for make bench.
 build/vx-cam: shell/main.swift shell/Info.plist pipeline/vxcam.h build/vxcam.o
 	swiftc -O -import-objc-header pipeline/vxcam.h shell/main.swift build/vxcam.o $(LIBS) \
 	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker shell/Info.plist -o $@
+	git -C $(VX) log -1 --format='%h %cs %s' > build/vx-commit.txt
 
 # The segmentation model's weights go next to the binary (models/README.md).
 build/selfie_segmentation_landscape.f32: models/selfie_segmentation_landscape.f32 | build
