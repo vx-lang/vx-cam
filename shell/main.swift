@@ -173,32 +173,35 @@ final class Pipeline {
 
   // Every buffer is shared: a stage on either device reads and writes it in place.
   let out: Shared<UInt8>
-  private let scratch, background, mask, history, maskScratch: Shared<Float>
+  private let scratch, background, history, maskScratch: Shared<Float>
   private let sums, means, coefs: Shared<Float>  // the guided filter of the mask
   private let stats: Shared<Int32>
-  /// What the first stages hand to blur and composite: the small image, the blurred one, the
-  /// guided filter's a and b, and the crop window that smooth keeps. There are two slots, so
-  /// that the CPU can start a frame while the GPU finishes the one before (runOverlapped).
-  /// A frame run one stage after another uses slot 0.
-  private let smalls, blurreds, abSlots, crops: [Shared<Float>]
+  /// What each stage hands to the next: the small image, the mask, the blurred image, the
+  /// guided filter's a and b, and the crop window that smooth keeps. Each frame in flight has
+  /// its own slot (runOverlapped, runAlternating). A frame run one stage after another uses
+  /// slot 0.
+  static let slots = 4
+  private let smalls, masks, blurreds, abSlots, crops: [Shared<Float>]
   private var cropSlot = 0  // the slot with the newest crop window
   private let fullFrame: Shared<Float>  // the whole frame, for when framing is off
   private let weights: Shared<Float>  // the blur's Gaussian
-  /// The segmentation model's weights and buffers, or nil for the stand-in.
-  private let model: (weights: Shared<Float>, arena: Shared<Float>)?
+  /// The segmentation model's weights, and two arenas for its buffers, so that it can run on
+  /// two frames at once (runAlternating). nil for the stand-in.
+  private let model: (weights: Shared<Float>, arenas: [Shared<Float>])?
+  var hasModel: Bool { model != nil }
 
   /// `gpu` names the stages that start on the GPU: "all", or names separated by commas.
   init(w: Int, h: Int, gpu: String = ProcessInfo.processInfo.environment["VXCAM_GPU"] ?? "") {
     self.w = w; self.h = h
     let n = (w / 4) * (h / 4)
     out = Shared(count: w * h * 4)
-    smalls = (0..<2).map { _ in Shared(count: n * 3) }
-    blurreds = (0..<2).map { _ in Shared(count: n * 3) }
-    abSlots = (0..<2).map { _ in Shared(count: n * 2) }
-    crops = (0..<2).map { _ in Shared(count: 4) }
+    smalls = (0..<Pipeline.slots).map { _ in Shared(count: n * 3) }
+    masks = (0..<Pipeline.slots).map { _ in Shared(count: n) }
+    blurreds = (0..<Pipeline.slots).map { _ in Shared(count: n * 3) }
+    abSlots = (0..<Pipeline.slots).map { _ in Shared(count: n * 2) }
+    crops = (0..<Pipeline.slots).map { _ in Shared(count: 4) }
     scratch = Shared(count: n * 3)
     background = Shared(count: n * 3)
-    mask = Shared(count: n)
     history = Shared(count: n)
     maskScratch = Shared(count: n)
     sums = Shared(count: n * 4); means = Shared(count: n * 4)
@@ -214,7 +217,7 @@ final class Pipeline {
        let data = try? Data(contentsOf: file), data.count == Int(VXCAM_MODEL_WEIGHTS) * 4 {
       let w = Shared<Float>(count: Int(VXCAM_MODEL_WEIGHTS))
       data.withUnsafeBytes { _ = memcpy(w.ptr, $0.baseAddress!, data.count) }
-      model = (w, Shared(count: Int(vxcam_model_offset(VXCAM_MODEL_BUFFERS))))
+      model = (w, (0..<2).map { _ in Shared(count: Int(vxcam_model_offset(VXCAM_MODEL_BUFFERS))) })
     } else { model = nil }
     vxcam_gaussian(weights.ptr, Int32(blurRadius))
     let names = Set(gpu.split(separator: ",").map(String.init))
@@ -230,18 +233,18 @@ final class Pipeline {
   }
 
   // Each GPU stage runs its kernels on the GPU, or their CPU copy on the same memory.
-  // `s` is the slot of buffers that the frame uses.
+  // `s` is the slot of buffers that the frame uses, and `a` the model's arena.
   private func runPreprocess(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool, _ s: Int = 0) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     vxcam_preprocess_frame(smalls[s].ptr, frame, Int64(w), Int64(h), Int64(stride), Int32(scale))
   }
 
-  private func runSegment(onGPU: Bool, _ s: Int = 0) {
+  private func runSegment(onGPU: Bool, _ s: Int = 0, _ a: Int = 0) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     if let model {
-      vxcam_model_frame(mask.ptr, smalls[s].ptr, model.weights.ptr, model.arena.ptr, Int64(sw), Int64(sh))
+      vxcam_model_frame(masks[s].ptr, smalls[s].ptr, model.weights.ptr, model.arenas[a].ptr, Int64(sw), Int64(sh))
     } else {
-      vxcam_segment_image(mask.ptr, background.ptr, smalls[s].ptr, Int64(sw), Int64(sh), Int64(frameIndex))
+      vxcam_segment_image(masks[s].ptr, background.ptr, smalls[s].ptr, Int64(sw), Int64(sh), Int64(frameIndex))
     }
   }
 
@@ -250,7 +253,7 @@ final class Pipeline {
     // smooth eases the crop window from where it was, so the slot starts from the newest one.
     if cropSlot != s { crops[s].ptr.update(from: crops[cropSlot].ptr, count: 4) }
     cropSlot = s
-    vxcam_smooth_mask(history.ptr, maskScratch.ptr, mask.ptr, stats.ptr, crops[s].ptr, Int64(sw),
+    vxcam_smooth_mask(history.ptr, maskScratch.ptr, masks[s].ptr, stats.ptr, crops[s].ptr, Int64(sw),
                       Int64(sh), Int64(w), Int64(h), Int64(frameIndex))
     vxcam_guide_mask(abSlots[s].ptr, sums.ptr, means.ptr, coefs.ptr, smalls[s].ptr, history.ptr, Int64(sw), Int64(sh))
   }
@@ -270,8 +273,8 @@ final class Pipeline {
                           Int64(stride), Int32(scale), Int32(mode))
   }
 
-  /// Runs stage `i` on frame `pb` with slot `s`, and returns its time in ms.
-  func runStage(_ i: Int, _ pb: CVPixelBuffer, onGPU: Bool, slot s: Int) -> Double {
+  /// Runs stage `i` on frame `pb` with slot `s` (and model arena `a`), and returns its time in ms.
+  func runStage(_ i: Int, _ pb: CVPixelBuffer, onGPU: Bool, slot s: Int, arena a: Int = 0) -> Double {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     precondition(CVPixelBufferGetWidth(pb) == w && CVPixelBufferGetHeight(pb) == h)
@@ -280,7 +283,7 @@ final class Pipeline {
     let t0 = DispatchTime.now().uptimeNanoseconds
     switch i {
     case 0: runPreprocess(frame, stride, onGPU: onGPU, s)
-    case 1: runSegment(onGPU: onGPU, s)
+    case 1: runSegment(onGPU: onGPU, s, a)
     case 2: runSmooth(onGPU: onGPU, s)
     case 3: runBlur(onGPU: onGPU, s)
     default: runComposite(frame, stride, onGPU: onGPU, s)
@@ -316,15 +319,15 @@ final class Pipeline {
     return Diff(name: name, differ: differ, total: buf.count * fills.count, worst: worst)
   }
 
-  /// A function that puts `buf` back as it is now.
   /// Writes the model's input and mask, for tools/check_model.py.
   func dumpModel(_ prefix: String) {
-    guard let a = model?.arena.ptr else { return }
+    guard let a = model?.arenas[0].ptr else { return }
     for (name, ptr, n) in [("input", vxcam_model_input(a)!, 144 * 256 * 3), ("model", vxcam_model_mask(a)!, 144 * 256)] {
       FileManager.default.createFile(atPath: "\(prefix)_\(name).f32", contents: Data(bytes: ptr, count: n * 4))
     }
   }
 
+  /// A function that puts `buf` back as it is now.
   private func snapshot<T>(_ buf: Shared<T>) -> () -> Void {
     let saved = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
     saved.update(from: buf.ptr, count: buf.count)
@@ -339,7 +342,7 @@ final class Pipeline {
     let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
     let stride = CVPixelBufferGetBytesPerRow(pb)
     if cropSlot != 0 { crops[0].ptr.update(from: crops[cropSlot].ptr, count: 4); cropSlot = 0 }
-    let (small, blurred, ab, crop) = (smalls[0], blurreds[0], abSlots[0], crops[0])
+    let (small, mask, blurred, ab, crop) = (smalls[0], masks[0], blurreds[0], abSlots[0], crops[0])
     // segment and smooth update state in place, so each run starts from a copy of it.
     let restoreBackground = snapshot(background)
     let restoreHistory = snapshot(history), restoreCrop = snapshot(crop)
@@ -497,7 +500,88 @@ func runOverlapped(_ p: Pipeline, _ source: VideoSource, frames: Int,
   return (nowMs() - start, frontBusy, backBusy)
 }
 
+/// Runs the model on both devices at once, on alternate frames. One thread runs preprocess and
+/// segment on the GPU for frames 0, 2, 4 and so on, a second runs them on the CPU for frames 1, 3,
+/// 5, and a third runs smooth, blur and composite on every frame in order, each on its own device
+/// (VXCAM_GPU). The two devices compute the same bits, so the output is the same as with the
+/// model on one of them. smooth carries state from frame to frame, so the third thread takes the
+/// frames in order. Each frame in flight has its own slot of buffers, and each model thread its
+/// own arena. `after(times, pb, time)` runs on the third thread after each frame, in order.
+/// Returns the wall time, and the busy time of the GPU model thread, the CPU model thread and the
+/// third thread, in ms.
+func runAlternating(_ p: Pipeline, _ source: VideoSource, frames: Int,
+                    after: @escaping ([Double], CVPixelBuffer, CMTime) -> Void) -> (wall: Double, busy: [Double]) {
+  precondition(p.hasModel, "the model alternates between the devices, so the stand-in cannot (VXCAM_SEGMENT)")
+  let n = Pipeline.slots
+  final class Hand { var frame: (pb: CVPixelBuffer, time: CMTime)?; var times = [Double](repeating: 0, count: 5) }
+  final class Busy { var ms = 0.0 }  // one for each thread, so no two threads write the same one
+  let hands = (0..<n).map { _ in Hand() }, busy = (0..<3).map { _ in Busy() }
+  // A semaphore must not end below the value it started with, so the free ones start at 0 and
+  // are signalled once.
+  let free = (0..<n).map { _ in DispatchSemaphore(value: 0) }
+  free.forEach { $0.signal() }
+  let work = [DispatchSemaphore(value: 0), DispatchSemaphore(value: 0)]  // frames for each model thread
+  let segmented = (0..<n).map { _ in DispatchSemaphore(value: 0) }
+  let finished = DispatchSemaphore(value: 0)
+  let onGPU = p.stages.map { $0.device == "GPU" }
+  func thread(_ body: @escaping () -> Void) -> Thread {
+    let t = Thread { body(); finished.signal() }
+    t.stackSize = 8 << 20
+    t.qualityOfService = .userInteractive
+    return t
+  }
+  let models = (0..<2).map { m in
+    thread {
+      var i = m
+      while true {
+        let s = i % n
+        work[m].wait()
+        guard let item = hands[s].frame else { segmented[s].signal(); break }  // the end
+        let t0 = nowMs()
+        for k in 0..<2 { hands[s].times[k] = p.runStage(k, item.pb, onGPU: m == 0, slot: s, arena: m) }
+        busy[m].ms += nowMs() - t0
+        segmented[s].signal()
+        i += 2
+      }
+    }
+  }
+  let last = thread {
+    var i = 0
+    while true {
+      let s = i % n
+      segmented[s].wait()
+      guard let item = hands[s].frame else { break }
+      let t0 = nowMs()
+      for k in 2..<5 { hands[s].times[k] = p.runStage(k, item.pb, onGPU: onGPU[k], slot: s) }
+      p.frameIndex += 1
+      busy[2].ms += nowMs() - t0
+      after(hands[s].times, item.pb, item.time)
+      hands[s].frame = nil
+      free[s].signal()
+      i += 1
+    }
+  }
+  let start = nowMs()
+  (models + [last]).forEach { $0.start() }
+  var i = 0
+  while i < frames, let pb = source.next() {
+    let s = i % n
+    free[s].wait()
+    hands[s].frame = (pb, source.time)
+    work[i % 2].signal()
+    i += 1
+  }
+  // An empty slot stops each model thread, and the first of them stops the third thread.
+  for k in i..<(i + 2) {
+    free[k % n].wait()
+    work[k % 2].signal()
+  }
+  for _ in 0..<3 { finished.wait() }
+  return (nowMs() - start, busy.map(\.ms))
+}
+
 /// Environment for a headless run: VXCAM_OVERLAP=1 overlaps frames (runOverlapped);
+/// VXCAM_ALTERNATE=1 runs the model on the GPU and the CPU for alternate frames (runAlternating);
 /// VXCAM_COMPARE_EVERY=K compares the devices every K frames (0: never; unset: the last frame);
 /// VXCAM_HASH=1 prints a hash of every output frame.
 func runHeadless(source: VideoSource, frames: Int, dir: String?) {
@@ -506,6 +590,7 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   let snapshots: Set<Int> = [20, 100, 200, 300, 350]
   let compareEvery = Int(env("VXCAM_COMPARE_EVERY") ?? "") ?? -1
   let hashing = env("VXCAM_HASH") == "1", overlap = env("VXCAM_OVERLAP") == "1"
+  let alternate = env("VXCAM_ALTERNATE") == "1"
   var digest: UInt64 = 0xcbf29ce484222325
   var diffs: [Diff] = [], compared = 0
   func tally(_ pb: CVPixelBuffer) {
@@ -520,9 +605,10 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   let warmup = min(10, frames / 4)
   var last: CVPixelBuffer?
   var log: [[Double]] = []  // per frame: each stage, then the whole frame
-  var wall = 0.0, busy: (front: Double, back: Double)?
+  var wall = 0.0, busy: (front: Double, back: Double)?, threads: [Double]?
+  var model: [[Double]] = [[], []]  // preprocess and segment, on the GPU and on the CPU
   var wallStart = 0.0
-  for i in 0..<(overlap ? warmup : frames) {
+  for i in 0..<(overlap || alternate ? warmup : frames) {
     if i == warmup { wallStart = nowMs() }
     guard let pb = i == 0 ? first : source.next() else { break }
     p.process(pb)
@@ -539,7 +625,17 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
     }
     if compareEvery > 0 && i % compareEvery == compareEvery - 1 { tally(pb) }
   }
-  if overlap {
+  if alternate {
+    var k = 0
+    let r = runAlternating(p, source, frames: frames - warmup) { times, pb, _ in
+      log.append(times + [times.reduce(0, +)])
+      model[k % 2].append(times[0] + times[1])
+      k += 1
+      if hashing { hashOutput(p, into: &digest) }
+      last = pb
+    }
+    wall = r.wall; threads = r.busy
+  } else if overlap {
     let r = runOverlapped(p, source, frames: frames - warmup) { times, pb, _ in
       log.append(times + [times.reduce(0, +)])
       if hashing { hashOutput(p, into: &digest) }
@@ -555,16 +651,25 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   func median(_ c: Int) -> Double { log.map { $0[c] }.sorted()[n / 2] }
   for i in p.stages.indices { p.stages[i].ms = median(i) }
   p.frameMs = median(p.stages.count)
+  if alternate { for k in 0..<2 { p.stages[k].device = "GPU/CPU" } }  // the medians mix the two
   print(p.table(fps: source.fps))
   let frame = log.map { $0[p.stages.count] }.sorted()
   print(String(format: "frame over %d frames: median %.2f ms, mean %.2f ms, slowest tenth from %.2f ms",
                n, frame[n / 2], frame.reduce(0, +) / Double(n), frame[n * 9 / 10]))
   let timed = frames - warmup
   print(String(format: "wall: %.2f ms a frame over %d frames, %.1f frames a second%@", wall / Double(timed), timed,
-               1000 * Double(timed) / wall, overlap ? " (frames overlap)" : ""))
+               1000 * Double(timed) / wall,
+               alternate ? " (the model alternates between the GPU and the CPU)" : overlap ? " (frames overlap)" : ""))
   if let busy {
     print(String(format: "overlap: the first thread is busy %.0f%% of the time, the second thread %.0f%%",
                  100 * busy.front / wall, 100 * busy.back / wall))
+  }
+  if let threads {
+    func mid(_ a: [Double]) -> Double { a.isEmpty ? 0 : a.sorted()[a.count / 2] }
+    print(String(format: "alternate: preprocess and segment take %.2f ms on the GPU and %.2f ms on the CPU; "
+                   + "the GPU model thread is busy %.0f%% of the time, the CPU one %.0f%%, the last stages %.0f%%",
+                 mid(model[0]), mid(model[1]), 100 * threads[0] / wall, 100 * threads[1] / wall,
+                 100 * threads[2] / wall))
   }
   if hashing { print(String(format: "output hash: %016llx over %d frames", digest, n)) }
   if compareEvery < 0, let last { tally(last) }

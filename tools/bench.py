@@ -4,7 +4,7 @@
     python3 tools/bench.py [--clip build/test_clip.mov] [--also record-1.mov]
                            [--tflite selfie_segmentation_landscape.tflite --python venv/bin/python]
 
-`make bench` runs it. It measures six things, on one machine at one time:
+`make bench` runs it. It measures seven things, on one machine at one time:
 
 1. The same bits on both devices: every buffer of every stage, run on the CPU and on the GPU
    from the same Vx source, compared every 10 frames over the whole clip.
@@ -23,6 +23,9 @@
 6. One wait for each function: on a Vx runtime that puts the GPU launches of a function in one
    command buffer (vx-lang/Vx#2781), segment alone on the GPU and all on the GPU, with a wait
    after each launch (VX_METAL_SYNC=1) and without, taken in turn. An older runtime skips it.
+7. The model on both devices: the model runs on the GPU for even frames and on the CPU for odd
+   ones (VXCAM_ALTERNATE=1), against all on the GPU, taken in turn, and each output hash against
+   all on the CPU.
 
 It waits until the load average is below --quiet (3 by default, up to 30 minutes) before each
 part and each round of placements, and records the load before and after each. Other work on the machine shows up in the numbers.
@@ -55,7 +58,7 @@ p.add_argument("--vx", default=os.path.expanduser("~/go/Vx"),
                help="the Vx checkout that built vxc, if build/vx-commit.txt is missing")
 p.add_argument("--only", help="parts to run, such as 1,2 (default: all)")
 args = p.parse_args()
-parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5, 6}
+parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5, 6, 7}
 os.makedirs(OUT, exist_ok=True)
 BIN = os.path.join(ROOT, "build", "vx-cam")
 
@@ -102,7 +105,7 @@ def run(gpu, clip=None, frames=None, env=None, folder=None):
 def parse(text):
     r = {"stages": {}}
     for line in text.splitlines():
-        m = re.match(r"^(\w+)\s+(CPU|GPU)\s+([\d.]+) ms", line)
+        m = re.match(r"^(\w+)\s+(CPU|GPU|GPU/CPU)\s+([\d.]+) ms", line)
         if m and m.group(1) in STAGES and m.group(1) not in r["stages"]:
             r["stages"][m.group(1)] = float(m.group(3))
         if m := re.match(r"^frame over \d+ frames: median ([\d.]+) ms", line):
@@ -111,6 +114,11 @@ def parse(text):
             r["wall"] = float(m.group(1))
         if m := re.match(r"^overlap: the (?:CPU|first) thread is busy (\d+)% of the time, the (?:GPU|second) thread (\d+)%", line):
             r["busy"] = [int(m.group(1)), int(m.group(2))]
+        if m := re.match(r"^alternate: preprocess and segment take ([\d.]+) ms on the GPU and ([\d.]+) ms on the "
+                         r"CPU; the GPU model thread is busy (\d+)% of the time, the CPU one (\d+)%, the last "
+                         r"stages (\d+)%", line):
+            r["alternate"] = {"model_gpu": float(m.group(1)), "model_cpu": float(m.group(2)),
+                              "busy": [int(m.group(k)) for k in (3, 4, 5)]}
         if m := re.match(r"^output hash: (\w+)", line):
             r["hash"] = m.group(1)
         if m := re.match(r"^(.+) CPU vs GPU: (\d+) of (\d+) values differ \(largest difference (.+)\)", line):
@@ -238,6 +246,30 @@ if 6 in parts:
         print("part 6: waits done")
     results["load"]["waits"].append(load())
 
+if 7 in parts:
+    results["load"]["alternate"] = [wait_quiet()]
+    reference = parse(run("", env={"VXCAM_HASH": "1"}))["hash"]
+    cases = [("all", "one after another", {}), ("all", "frames overlap", {"VXCAM_OVERLAP": "1"}),
+             ("smooth,blur,composite", "the model alternates", {"VXCAM_ALTERNATE": "1"}),
+             ("composite", "the model alternates", {"VXCAM_ALTERNATE": "1"})]
+    alt = [[] for _ in cases]
+    for k in range(args.runs):
+        for i, (g, _, e) in enumerate(cases):
+            alt[i].append(parse(run(g, env=e)))
+    rows = []
+    for (g, mode, e), rs in zip(cases, alt):
+        walls = [r["wall"] for r in rs]
+        row = {"gpu": g, "mode": mode, "wall": statistics.median(walls), "wall_min": min(walls),
+               "wall_max": max(walls),
+               "same_output_as_all_cpu": parse(run(g, env={**e, "VXCAM_HASH": "1"}))["hash"] == reference}
+        if "alternate" in rs[0]:
+            row.update({key: statistics.median(r["alternate"][key] for r in rs) for key in ("model_gpu", "model_cpu")})
+            row["busy"] = [statistics.median(r["alternate"]["busy"][j] for r in rs) for j in range(3)]
+        rows.append(row)
+    results["alternate"] = rows
+    results["load"]["alternate"].append(load())
+    print("part 7: alternate done")
+
 json.dump(results, open(os.path.join(OUT, "results.json"), "w"), indent=1)
 
 # The report.
@@ -337,6 +369,22 @@ if "waits" in results:
         L.append(f"| {a['label']} | {'yes' if w['overlap'] else 'no'} | {a['wall']:.2f} | {b['wall']:.2f} "
                  f"| {a['wall'] / b['wall']:.2f}x | {a['stages']['segment']:.2f} | {b['stages']['segment']:.2f} |")
     L.append("")
+
+if "alternate" in results:
+    L += ["## 7. The model on both devices", "",
+          "One thread runs preprocess and segment on the GPU for the even frames, a second runs them on the CPU "
+          "for the odd ones, and a third runs smooth, blur and composite on every frame in order. The devices "
+          "compute the same bits, so the output does not change. Wall time a frame, median of the runs:", "",
+          "| Stages on the GPU | Mode | Wall ms | Range | Model on the GPU | Model on the CPU "
+          "| Same output as all CPU |",
+          "| --- | --- | ---: | --- | ---: | ---: | --- |"]
+    for r in results["alternate"]:
+        gpu = "all" if r["gpu"] == "all" else r["gpu"].replace(",", ", ")
+        model = (f"{r['model_gpu']:.2f} | {r['model_cpu']:.2f}" if "model_gpu" in r else "- | -")
+        L.append(f"| {gpu} | {r['mode']} | {r['wall']:.2f} | {r['wall_min']:.2f} to {r['wall_max']:.2f} | {model} "
+                 f"| {'yes' if r['same_output_as_all_cpu'] else 'NO'} |")
+    L += ["", "With the model alternating, the GPU and the CPU each run it on every other frame, so preprocess "
+              "and segment are in the alternating threads and the stages on the GPU are the rest.", ""]
 
 open(os.path.join(OUT, "report.md"), "w").write("\n".join(L))
 print("wrote", os.path.join(OUT, "report.md"))
