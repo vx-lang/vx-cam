@@ -140,6 +140,13 @@ final class Shared<T> {
   deinit { free(ptr) }
 }
 
+/// One buffer compared between the devices, over one frame or many.
+struct Diff {
+  let name: String
+  var differ: Int, total: Int, worst: Double
+  var text: String { "\(name) CPU vs GPU: \(differ) of \(total) values differ (largest difference \(worst))" }
+}
+
 /// One stage as the overlay shows it.
 struct StageInfo {
   let name: String
@@ -166,11 +173,16 @@ final class Pipeline {
 
   // Every buffer is shared: a stage on either device reads and writes it in place.
   let out: Shared<UInt8>
-  private let small, blurred, scratch, background, mask, history, maskScratch: Shared<Float>
-  private let sums, means, coefs, ab: Shared<Float>  // the guided filter of the mask
+  private let scratch, background, mask, history, maskScratch: Shared<Float>
+  private let sums, means, coefs: Shared<Float>  // the guided filter of the mask
   private let stats: Shared<Int32>
-  /// The crop window that smooth keeps, and the whole frame for when framing is off.
-  private let crop, fullFrame: Shared<Float>
+  /// What the first stages hand to blur and composite: the small image, the blurred one, the
+  /// guided filter's a and b, and the crop window that smooth keeps. There are two slots, so
+  /// that the CPU can start a frame while the GPU finishes the one before (runOverlapped).
+  /// A frame run one stage after another uses slot 0.
+  private let smalls, blurreds, abSlots, crops: [Shared<Float>]
+  private var cropSlot = 0  // the slot with the newest crop window
+  private let fullFrame: Shared<Float>  // the whole frame, for when framing is off
   private let weights: Shared<Float>  // the blur's Gaussian
   /// The segmentation model's weights and buffers, or nil for the stand-in.
   private let model: (weights: Shared<Float>, arena: Shared<Float>)?
@@ -180,17 +192,18 @@ final class Pipeline {
     self.w = w; self.h = h
     let n = (w / 4) * (h / 4)
     out = Shared(count: w * h * 4)
-    small = Shared(count: n * 3)
-    blurred = Shared(count: n * 3)
+    smalls = (0..<2).map { _ in Shared(count: n * 3) }
+    blurreds = (0..<2).map { _ in Shared(count: n * 3) }
+    abSlots = (0..<2).map { _ in Shared(count: n * 2) }
+    crops = (0..<2).map { _ in Shared(count: 4) }
     scratch = Shared(count: n * 3)
     background = Shared(count: n * 3)
     mask = Shared(count: n)
     history = Shared(count: n)
     maskScratch = Shared(count: n)
     sums = Shared(count: n * 4); means = Shared(count: n * 4)
-    coefs = Shared(count: n * 2); ab = Shared(count: n * 2)
+    coefs = Shared(count: n * 2)
     stats = Shared(count: (h / 4) * 3)
-    crop = Shared(count: 4)
     fullFrame = Shared(count: 4)
     fullFrame.ptr[2] = Float(w)
     fullFrame.ptr[3] = Float(h)
@@ -217,39 +230,62 @@ final class Pipeline {
   }
 
   // Each GPU stage runs its kernels on the GPU, or their CPU copy on the same memory.
-  private func runPreprocess(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool) {
+  // `s` is the slot of buffers that the frame uses.
+  private func runPreprocess(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool, _ s: Int = 0) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
-    vxcam_preprocess_frame(small.ptr, frame, Int64(w), Int64(h), Int64(stride), Int32(scale))
+    vxcam_preprocess_frame(smalls[s].ptr, frame, Int64(w), Int64(h), Int64(stride), Int32(scale))
   }
 
-  private func runSegment(onGPU: Bool) {
+  private func runSegment(onGPU: Bool, _ s: Int = 0) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     if let model {
-      vxcam_model_frame(mask.ptr, small.ptr, model.weights.ptr, model.arena.ptr, Int64(sw), Int64(sh))
+      vxcam_model_frame(mask.ptr, smalls[s].ptr, model.weights.ptr, model.arena.ptr, Int64(sw), Int64(sh))
     } else {
-      vxcam_segment_image(mask.ptr, background.ptr, small.ptr, Int64(sw), Int64(sh), Int64(frameIndex))
+      vxcam_segment_image(mask.ptr, background.ptr, smalls[s].ptr, Int64(sw), Int64(sh), Int64(frameIndex))
     }
   }
 
-  private func runSmooth(onGPU: Bool) {
+  private func runSmooth(onGPU: Bool, _ s: Int = 0) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
-    vxcam_smooth_mask(history.ptr, maskScratch.ptr, mask.ptr, stats.ptr, crop.ptr, Int64(sw),
+    // smooth eases the crop window from where it was, so the slot starts from the newest one.
+    if cropSlot != s { crops[s].ptr.update(from: crops[cropSlot].ptr, count: 4) }
+    cropSlot = s
+    vxcam_smooth_mask(history.ptr, maskScratch.ptr, mask.ptr, stats.ptr, crops[s].ptr, Int64(sw),
                       Int64(sh), Int64(w), Int64(h), Int64(frameIndex))
-    vxcam_guide_mask(ab.ptr, sums.ptr, means.ptr, coefs.ptr, small.ptr, history.ptr, Int64(sw), Int64(sh))
+    vxcam_guide_mask(abSlots[s].ptr, sums.ptr, means.ptr, coefs.ptr, smalls[s].ptr, history.ptr, Int64(sw), Int64(sh))
   }
 
-  private func runBlur(onGPU: Bool) {
+  private func runBlur(onGPU: Bool, _ s: Int = 0) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
-    vxcam_blur_image(blurred.ptr, scratch.ptr, small.ptr, weights.ptr, Int64(sw), Int64(sh),
+    vxcam_blur_image(blurreds[s].ptr, scratch.ptr, smalls[s].ptr, weights.ptr, Int64(sw), Int64(sh),
                      Int32(blurRadius))
   }
 
-  private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool, outline: Bool? = nil) {
+  private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool, _ s: Int = 0,
+                            outline: Bool? = nil) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
-    let window = autoFraming ? crop : fullFrame
+    let window = autoFraming ? crops[s] : fullFrame
     let mode = self.mode + ((outline ?? self.outline) ? 3 : 0)
-    vxcam_composite_frame(out.ptr, frame, blurred.ptr, ab.ptr, window.ptr, Int64(w), Int64(h),
+    vxcam_composite_frame(out.ptr, frame, blurreds[s].ptr, abSlots[s].ptr, window.ptr, Int64(w), Int64(h),
                           Int64(stride), Int32(scale), Int32(mode))
+  }
+
+  /// Runs stage `i` on frame `pb` with slot `s`, and returns its time in ms.
+  func runStage(_ i: Int, _ pb: CVPixelBuffer, onGPU: Bool, slot s: Int) -> Double {
+    CVPixelBufferLockBaseAddress(pb, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    precondition(CVPixelBufferGetWidth(pb) == w && CVPixelBufferGetHeight(pb) == h)
+    let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
+    let stride = CVPixelBufferGetBytesPerRow(pb)
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    switch i {
+    case 0: runPreprocess(frame, stride, onGPU: onGPU, s)
+    case 1: runSegment(onGPU: onGPU, s)
+    case 2: runSmooth(onGPU: onGPU, s)
+    case 3: runBlur(onGPU: onGPU, s)
+    default: runComposite(frame, stride, onGPU: onGPU, s)
+    }
+    return Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
   }
 
   /// Runs `run` on the CPU, then on the GPU over each fill of `buf`, and compares the
@@ -259,7 +295,7 @@ final class Pipeline {
   /// runs before each run, to put back the state that a stage keeps between frames.
   private func compare<T>(_ name: String, _ buf: Shared<T>, fills: [Int32?],
                           _ value: (T) -> Double, reset: () -> Void = {},
-                          _ run: (Bool) -> Void) -> String {
+                          _ run: (Bool) -> Void) -> Diff {
     reset()
     run(false)
     let cpu = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
@@ -277,7 +313,7 @@ final class Pipeline {
         worst = max(worst, abs(value(cpu[i]) - value(buf.ptr[i])))
       }
     }
-    return "\(name) CPU vs GPU: \(differ) of \(buf.count * fills.count) values differ (largest difference \(worst))"
+    return Diff(name: name, differ: differ, total: buf.count * fills.count, worst: worst)
   }
 
   /// A function that puts `buf` back as it is now.
@@ -295,12 +331,15 @@ final class Pipeline {
     return { buf.ptr.update(from: saved, count: buf.count) }  // kept for the check only
   }
 
-  /// Runs each stage on both devices over `pb`, in pipeline order, and compares.
-  func compareStages(_ pb: CVPixelBuffer) -> [String] {
+  /// Runs each stage on both devices over `pb`, in pipeline order, and compares. It uses
+  /// slot 0, as a frame run one stage after another does.
+  func compareStages(_ pb: CVPixelBuffer) -> [Diff] {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
     let stride = CVPixelBufferGetBytesPerRow(pb)
+    if cropSlot != 0 { crops[0].ptr.update(from: crops[cropSlot].ptr, count: 4); cropSlot = 0 }
+    let (small, blurred, ab, crop) = (smalls[0], blurreds[0], abSlots[0], crops[0])
     // segment and smooth update state in place, so each run starts from a copy of it.
     let restoreBackground = snapshot(background)
     let restoreHistory = snapshot(history), restoreCrop = snapshot(crop)
@@ -323,31 +362,26 @@ final class Pipeline {
     ]
   }
 
-  private func timed(_ i: Int, _ body: () -> Void) {
-    let t0 = DispatchTime.now().uptimeNanoseconds
-    body()
-    let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
-    stages[i].last = ms
-    stages[i].ms = frameIndex == 0 ? ms : stages[i].ms * 0.9 + ms * 0.1
-  }
-
-  private func onGPU(_ i: Int) -> Bool { stages[i].device == "GPU" }
-
-  func process(_ pb: CVPixelBuffer) {
-    CVPixelBufferLockBaseAddress(pb, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-    precondition(CVPixelBufferGetWidth(pb) == w && CVPixelBufferGetHeight(pb) == h)
-    let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
-    let stride = CVPixelBufferGetBytesPerRow(pb)
-    let start = DispatchTime.now().uptimeNanoseconds
-    timed(0) { runPreprocess(frame, stride, onGPU: onGPU(0)) }
-    timed(1) { runSegment(onGPU: onGPU(1)) }
-    timed(2) { runSmooth(onGPU: onGPU(2)) }
-    timed(3) { runBlur(onGPU: onGPU(3)) }
-    timed(4) { runComposite(frame, stride, onGPU: onGPU(4)) }
-    let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+  /// Records one frame's stage times, and its whole time, in the moving averages.
+  func record(_ times: [Double], frame ms: Double) {
+    let first = recorded == 0
+    recorded += 1
+    for i in stages.indices {
+      stages[i].last = times[i]
+      stages[i].ms = first ? times[i] : stages[i].ms * 0.9 + times[i] * 0.1
+    }
     lastFrameMs = ms
-    frameMs = frameIndex == 0 ? ms : frameMs * 0.9 + ms * 0.1
+    frameMs = first ? ms : frameMs * 0.9 + ms * 0.1
+  }
+  private var recorded = 0
+  /// Set while runOverlapped runs: the stages on each of its two threads, for the panel.
+  var lanes: (cpu: [Int], gpu: [Int])?
+
+  /// Runs the five stages on `pb` one after another, in slot 0.
+  func process(_ pb: CVPixelBuffer) {
+    let start = DispatchTime.now().uptimeNanoseconds
+    let times = stages.indices.map { runStage($0, pb, onGPU: stages[$0].device == "GPU", slot: 0) }
+    record(times, frame: Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
     frameIndex += 1
   }
 
@@ -387,17 +421,112 @@ func writePNG(_ img: CGImage, to path: String) {
   CGImageDestinationFinalize(dest)
 }
 
+func env(_ name: String) -> String? { ProcessInfo.processInfo.environment[name] }
+func nowMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+
+/// FNV-1a over the output frame, eight bytes at a time, to show that two runs made the same frames.
+func hashOutput(_ p: Pipeline, into digest: inout UInt64) {
+  let words = UnsafeRawPointer(p.out.ptr).assumingMemoryBound(to: UInt64.self)
+  for i in 0..<(p.w * p.h * 4 / 8) { digest = (digest ^ words[i]) &* 0x100000001b3 }
+}
+
+/// Runs up to `frames` frames of `source` on two threads, so that the CPU and the GPU work at
+/// the same time. The calling thread runs the first stages of frame i while a second thread
+/// runs the last ones, which are on the GPU, for frame i - 1: composite, and blur too when it is
+/// on the GPU. Each of the two frames in flight has its own slot of buffers (Pipeline.smalls and
+/// the rest), so a thread waits only to take a slot that the other has finished with. A frame
+/// comes out one frame later than it would one stage after another. `after(times, pb, time)` runs
+/// on the second thread after each frame, in order, with the frame's time in the clip. Returns the
+/// wall time and each thread's busy time, in ms.
+func runOverlapped(_ p: Pipeline, _ source: VideoSource, frames: Int,
+                   after: @escaping ([Double], CVPixelBuffer, CMTime) -> Void) -> (wall: Double, cpu: Double, gpu: Double) {
+  let onGPU = p.stages.map { $0.device == "GPU" }
+  guard onGPU[4] else { fatalError("frames overlap only with composite on the GPU (VXCAM_GPU)") }
+  let back = onGPU[3] ? [3, 4] : [4]
+  let front = p.stages.indices.filter { !back.contains($0) }
+  p.lanes = (front, back)
+  final class Hand { var frame: (pb: CVPixelBuffer, times: [Double], time: CMTime)? }
+  let hands = [Hand(), Hand()]
+  // A semaphore must not end below the value it started with, so the free ones start at 0 and
+  // are signalled once.
+  let free = [DispatchSemaphore(value: 0), DispatchSemaphore(value: 0)]
+  free.forEach { $0.signal() }
+  let ready = [DispatchSemaphore(value: 0), DispatchSemaphore(value: 0)]
+  let finished = DispatchSemaphore(value: 0)
+  var backBusy = 0.0
+  let worker = Thread {
+    var i = 0
+    while true {
+      let s = i % 2
+      ready[s].wait()
+      guard let item = hands[s].frame else { break }
+      let pb = item.pb
+      var times = item.times
+      let t0 = nowMs()
+      for k in back { times[k] = p.runStage(k, pb, onGPU: true, slot: s) }
+      backBusy += nowMs() - t0
+      after(times, pb, item.time)
+      hands[s].frame = nil
+      free[s].signal()
+      i += 1
+    }
+    finished.signal()
+  }
+  worker.stackSize = 8 << 20
+  worker.qualityOfService = .userInteractive
+  let start = nowMs()
+  worker.start()
+  var frontBusy = 0.0
+  var i = 0
+  while i < frames, let pb = source.next() {
+    let s = i % 2
+    free[s].wait()
+    let t0 = nowMs()
+    var times = [Double](repeating: 0, count: onGPU.count)
+    for k in front { times[k] = p.runStage(k, pb, onGPU: onGPU[k], slot: s) }
+    p.frameIndex += 1
+    frontBusy += nowMs() - t0
+    hands[s].frame = (pb, times, source.time)
+    ready[s].signal()
+    i += 1
+  }
+  free[i % 2].wait()  // the worker stops at an empty slot
+  ready[i % 2].signal()
+  finished.wait()
+  return (nowMs() - start, frontBusy, backBusy)
+}
+
+/// Environment for a headless run: VXCAM_OVERLAP=1 overlaps frames (runOverlapped);
+/// VXCAM_COMPARE_EVERY=K compares the devices every K frames (0: never; unset: the last frame);
+/// VXCAM_HASH=1 prints a hash of every output frame.
 func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   guard let first = source.next() else { fatalError("the clip has no frames") }
   let p = Pipeline(w: CVPixelBufferGetWidth(first), h: CVPixelBufferGetHeight(first))
   let snapshots: Set<Int> = [20, 100, 200, 300, 350]
-  var buf: CVPixelBuffer? = first
+  let compareEvery = Int(env("VXCAM_COMPARE_EVERY") ?? "") ?? -1
+  let hashing = env("VXCAM_HASH") == "1", overlap = env("VXCAM_OVERLAP") == "1"
+  var digest: UInt64 = 0xcbf29ce484222325
+  var diffs: [Diff] = [], compared = 0
+  func tally(_ pb: CVPixelBuffer) {
+    let d = p.compareStages(pb)
+    compared += 1
+    if diffs.isEmpty { diffs = d; return }
+    for k in d.indices {
+      diffs[k].differ += d[k].differ; diffs[k].total += d[k].total; diffs[k].worst = max(diffs[k].worst, d[k].worst)
+    }
+  }
+  // The first frames build Metal's pipelines and fill the caches, so the wall time leaves them out.
+  let warmup = min(10, frames / 4)
   var last: CVPixelBuffer?
   var log: [[Double]] = []  // per frame: each stage, then the whole frame
-  for i in 0..<frames {
-    guard let pb = buf else { break }
+  var wall = 0.0, busy: (cpu: Double, gpu: Double)?
+  var wallStart = 0.0
+  for i in 0..<(overlap ? warmup : frames) {
+    if i == warmup { wallStart = nowMs() }
+    guard let pb = i == 0 ? first : source.next() else { break }
     p.process(pb)
     log.append(p.stages.map { $0.last } + [p.lastFrameMs])
+    if hashing { hashOutput(p, into: &digest) }
     last = pb
     if let dir, snapshots.contains(i) {
       writePNG(p.image(), to: "\(dir)/frame\(i).png")
@@ -407,7 +536,17 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
       writePNG(p.image(), to: "\(dir)/frame\(i)_mask.png")
       p.mode = 0
     }
-    buf = source.next()
+    if compareEvery > 0 && i % compareEvery == compareEvery - 1 { tally(pb) }
+  }
+  if overlap {
+    let r = runOverlapped(p, source, frames: frames - warmup) { times, pb, _ in
+      log.append(times + [times.reduce(0, +)])
+      if hashing { hashOutput(p, into: &digest) }
+      last = pb
+    }
+    wall = r.wall; busy = (r.cpu, r.gpu)
+  } else {
+    wall = nowMs() - wallStart
   }
   // The overlay shows moving averages, which mostly reflect the last frames. The GPU changes its
   // clock during a run, so a run reports the median of each column, and the spread of the frame.
@@ -419,7 +558,17 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   let frame = log.map { $0[p.stages.count] }.sorted()
   print(String(format: "frame over %d frames: median %.2f ms, mean %.2f ms, slowest tenth from %.2f ms",
                n, frame[n / 2], frame.reduce(0, +) / Double(n), frame[n * 9 / 10]))
-  if let last { p.compareStages(last).forEach { print($0) } }
+  let timed = frames - warmup
+  print(String(format: "wall: %.2f ms a frame over %d frames, %.1f frames a second%@", wall / Double(timed), timed,
+               1000 * Double(timed) / wall, overlap ? " (frames overlap)" : ""))
+  if let busy {
+    print(String(format: "overlap: the CPU thread is busy %.0f%% of the time, the GPU thread %.0f%%",
+                 100 * busy.cpu / wall, 100 * busy.gpu / wall))
+  }
+  if hashing { print(String(format: "output hash: %016llx over %d frames", digest, n)) }
+  if compareEvery < 0, let last { tally(last) }
+  diffs.forEach { print($0.text) }
+  if compared > 1 { print("compared on \(compared) frames") }
 }
 
 /// Runs every frame of the clip once and writes the output frames to a movie, at their times.
@@ -445,10 +594,8 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
   writer.add(input)
   writer.startWriting()
   writer.startSession(atSourceTime: source.time)
-  var buf: CVPixelBuffer? = first
   var n = 0
-  while let pb = buf {
-    p.process(pb)
+  func emit(_ time: CMTime) {
     var frame: CVPixelBuffer?
     CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &frame)
     guard let frame else { fatalError("no buffer to write frame \(n) into") }
@@ -458,9 +605,25 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
     CVPixelBufferUnlockBaseAddress(frame, [])
     if options.contains("panel") { drawPanel(on: frame, p, fps: source.fps) }
     while !input.isReadyForMoreMediaData { usleep(1000) }
-    adaptor.append(frame, withPresentationTime: source.time)
+    adaptor.append(frame, withPresentationTime: time)
     n += 1
-    buf = source.next()
+  }
+  p.process(first)
+  emit(source.time)
+  if env("VXCAM_OVERLAP") == "1" {
+    // The panel's frame time is the time between frames, while the stages of two frames overlap.
+    var lastDone = nowMs()
+    _ = runOverlapped(p, source, frames: Int.max) { times, _, time in
+      let done = nowMs()
+      p.record(times, frame: done - lastDone)
+      lastDone = done
+      emit(time)
+    }
+  } else {
+    while let pb = source.next() {
+      p.process(pb)
+      emit(source.time)
+    }
   }
   input.markAsFinished()
   let done = DispatchSemaphore(value: 0)
@@ -498,8 +661,8 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   }
   // CG's origin is the bottom left; the panel hangs from the top left.
   let budget = 1000 / fps, x0 = 28.0, row = 27.0, strip = 440.0
-  let top = Double(p.h) - 20
-  box(CGRect(x: x0 - 14, y: top - row * 9.6, width: strip + 28, height: row * 9.6), CGColor(gray: 0, alpha: 0.62), radius: 10)
+  let top = Double(p.h) - 20, tall = row * (p.lanes == nil ? 9.6 : 10.6)
+  box(CGRect(x: x0 - 14, y: top - tall, width: strip + 28, height: tall), CGColor(gray: 0, alpha: 0.62), radius: 10)
   var y = top - row
   text("Each stage is Vx, on the CPU or the GPU", x0, y, white, size: 16, bold: true)
   for st in p.stages {
@@ -512,21 +675,30 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
     text(String(format: "%5.2f ms", st.ms), x0 + 370, y, white)
   }
   y -= row * 1.3
-  text(String(format: "one frame: %.1f ms of the %.1f ms budget", p.frameMs, budget), x0, y, white)
+  text(String(format: p.lanes == nil ? "one frame: %.1f ms of the %.1f ms budget"
+                                     : "a frame every %.1f ms (budget %.1f ms)", p.frameMs, budget), x0, y, white)
   y -= row
-  // The stages run in turn: the CPU waits for each GPU stage, and hands over its buffers in place.
+  // One after another, the stages of a frame run in turn, and the CPU waits for each GPU stage.
+  // With frames overlapping, the two lanes run at the same time: the first stages of the next
+  // frame, and the last ones of this frame. Either way the buffers pass over in place.
+  let lanes = p.lanes.map { [("next frame", $0.cpu), ("this frame", $0.gpu)] } ?? [("", Array(p.stages.indices))]
+  let laneX = p.lanes == nil ? x0 : x0 + 104, laneW = strip - (laneX - x0)
   ctx.setStrokeColor(dim)
-  ctx.stroke(CGRect(x: x0, y: y - 5, width: strip, height: 22), width: 1)
-  var x = x0
-  for st in p.stages {
-    let wide = strip * min(st.ms / budget, 1)
-    box(CGRect(x: x, y: y - 5, width: max(wide - 1, 1), height: 22), st.device == "GPU" ? gpu : cpu, radius: 0)
-    let label = String(st.name.prefix(wide > 70 ? 7 : 3))
-    if wide > 30 { text(label, x + 4, y, black, size: 13, bold: true) }
-    x += wide
+  for (label, stages) in lanes {
+    if !label.isEmpty { text(label, x0, y, dim, size: 14) }
+    ctx.stroke(CGRect(x: laneX, y: y - 5, width: laneW, height: 22), width: 1)
+    var x = laneX
+    for st in stages.map({ p.stages[$0] }) {
+      let wide = laneW * min(st.ms / budget, 1)
+      box(CGRect(x: x, y: y - 5, width: max(wide - 1, 1), height: 22), st.device == "GPU" ? gpu : cpu, radius: 0)
+      let short = String(st.name.prefix(wide > 70 ? 7 : 3))
+      if wide > 30 { text(short, x + 4, y, black, size: 13, bold: true) }
+      x += wide
+    }
+    y -= row
   }
-  y -= row
-  text("CPU and GPU share memory: 0 bytes copied", x0, y, dim, size: 14)
+  text(p.lanes == nil ? "CPU and GPU share memory: 0 bytes copied"
+                      : "CPU and GPU at the same time, 0 bytes copied", x0, y, dim, size: 14)
 }
 
 // MARK: - Window
