@@ -41,6 +41,16 @@ ensures writes_only()
   return m;
 }
 
+fn max_i32(a : i32, b : i32) on Topology::Any -> i32
+ensures writes_only()
+{
+  let mut m = a;
+  if b > a {
+    m = b;
+  }
+  return m;
+}
+
 fn clamp_i32(v : i32, lo : i32, hi : i32) on Topology::Any -> i32
 ensures writes_only()
 {
@@ -214,6 +224,453 @@ sw : i32, sh : i32, frame_index : i32) -> void {
     first = 1;
   }
   segment_kernel(mask, background, small, sw, sh, first);
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 2, the model: MediaPipe Selfie Segmentation, landscape (Google, Apache
+// License 2.0; see models/README.md). A MobileNetV3-like network on a 144 x 256
+// RGB image, which gives a 144 x 256 mask. Its 55 layers of weights are one
+// tensor, in the order of the network, so each layer's weights start where the
+// last one's end. Each layer is a conv kernel (OHWI, or 1HWC for a depthwise
+// one) and then its bias.
+//
+// Every buffer is flat, [1, n], and holds an image as HWC. Each kernel has one
+// lane per output element. A sigmoid needs exp, and the CPU and the GPU need
+// not agree on its last bit, so `exp_f32` uses only + - * / and gives the same
+// bits on both.
+//===----------------------------------------------------------------------===//
+
+// e^x for x in [-87, 87], to about 1e-7: e^x = 2^k e^r with |r| <= ln 2 / 2,
+// e^r from its Taylor series, and 2^k from the bits of k.
+fn exp_f32(x : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let v = clamp_f32(x, 0.0 - 87.0, 87.0);
+  let t = v * 1.442695 + 0.5;
+  let mut k = t as i32;
+  if (k as f32) > t {
+    k = k - 1;
+  }
+  let r = v - (k as f32) * 0.693145752 - (k as f32) * 0.0000014286068;
+  let e = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.041666668 + r * (0.008333334
+  + r * (0.0013888889 + r * 0.0001984127))))));
+  let mut n = k;
+  let mut base : f32 = 2.0;
+  if k < 0 {
+    n = 0 - k;
+    base = 0.5;
+  }
+  let mut p : f32 = 1.0;
+  for bit in 0..7 {
+    if n - (n / 2) * 2 == 1 {
+      p = p * base;
+    }
+    base = base * base;
+    n = n / 2;
+  }
+  return e * p;
+}
+
+// The activations: 0 none, 1 relu, 2 hard swish, 3 sigmoid.
+fn activate(v : f32, kind : i32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let mut out = v;
+  if kind == 1 {
+    out = max_f32(v, 0.0);
+  }
+  if kind == 2 {
+    out = v * clamp_f32(v + 3.0, 0.0, 6.0) / 6.0;
+  }
+  if kind == 3 {
+    out = 1.0 / (1.0 + exp_f32(0.0 - v));
+  }
+  return out;
+}
+
+// The model's input: `small` resampled to 144 x 256 RGB, with half-pixel centres.
+fn model_input(inp : &mut Tensor<f32, [?, ?], Memory::HBM>,
+small : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
+  let n : i32 = 144 * 256 * 3;
+  spawn on(Topology::Device) {
+    for g in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let i = g * 256 + l;
+        if i < n {
+          let p = i / 3;
+          let c = i - p * 3;
+          let y = p / 256;
+          let x = p - y * 256;
+          let sy = clamp_f32(((y as f32) + 0.5) * (sh as f32) / 144.0 - 0.5, 0.0, (sh - 1) as f32);
+          let sx = clamp_f32(((x as f32) + 0.5) * (sw as f32) / 256.0 - 0.5, 0.0, (sw - 1) as f32);
+          let y0 = sy as i32;
+          let x0 = sx as i32;
+          inp[0][i] = sample_f32(small, y0, min_i32(y0 + 1, sh - 1), x0 * 3 + c,
+          min_i32(x0 + 1, sw - 1) * 3 + c, sx - x0 as f32, sy - y0 as f32);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// A k x k convolution with stride s and the padding of TFLite's SAME: `pt` and
+// `pl` are the rows and columns of zeros before the image.
+fn conv_kxk(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
+src : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
+h : i32, w : i32, cin : i32, oh : i32, ow : i32, cout : i32, k : i32, s : i32, pt : i32,
+pl : i32, act : i32) -> void {
+  let n = oh * ow * cout;
+  spawn on(Topology::Device) {
+    for g in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let i = g * 256 + l;
+        if i < n {
+          let p = i / cout;
+          let co = i - p * cout;
+          let oy = p / ow;
+          let ox = p - oy * ow;
+          let mut acc = wts[0][off + cout * k * k * cin + co];
+          for ky in 0..k {
+            for kx in 0..k {
+              let iy = oy * s + ky - pt;
+              let ix = ox * s + kx - pl;
+              if iy >= 0 && iy < h && ix >= 0 && ix < w {
+                for ci in 0..cin {
+                  acc = acc + wts[0][off + ((co * k + ky) * k + kx) * cin + ci]
+                  * src[0][(iy * w + ix) * cin + ci];
+                }
+              }
+            }
+          }
+          dst[0][i] = activate(acc, act);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// A 1 x 1 convolution over `npix` pixels. Its input is src, times gate[ci] when
+// `use_gate` is 1, plus src2 when `use_src2` is 1. After the activation, it adds
+// res when `use_res` is 1.
+fn pw(dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>,
+src2 : &Tensor<f32, [?, ?], Memory::HBM>, gate : &Tensor<f32, [?, ?], Memory::HBM>,
+res : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
+npix : i32, cin : i32, cout : i32, use_gate : i32, use_src2 : i32, use_res : i32,
+act : i32) -> void {
+  let n = npix * cout;
+  spawn on(Topology::Device) {
+    for g in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let i = g * 256 + l;
+        if i < n {
+          let p = i / cout;
+          let co = i - p * cout;
+          let mut acc = wts[0][off + cout * cin + co];
+          for ci in 0..cin {
+            let mut v = src[0][p * cin + ci];
+            if use_gate == 1 {
+              v = v * gate[0][ci];
+            }
+            if use_src2 == 1 {
+              v = v + src2[0][p * cin + ci];
+            }
+            acc = acc + wts[0][off + co * cin + ci] * v;
+          }
+          let mut out = activate(acc, act);
+          if use_res == 1 {
+            out = out + res[0][i];
+          }
+          dst[0][i] = out;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// A k x k depthwise convolution with stride s, SAME padding. After the
+// activation, it adds its own input when `use_res` is 1 (stride 1 only).
+fn dw(dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>,
+wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32, h : i32, w : i32, c : i32, oh : i32,
+ow : i32, k : i32, s : i32, pt : i32, pl : i32, act : i32, use_res : i32) -> void {
+  let n = oh * ow * c;
+  spawn on(Topology::Device) {
+    for g in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let i = g * 256 + l;
+        if i < n {
+          let p = i / c;
+          let ch = i - p * c;
+          let oy = p / ow;
+          let ox = p - oy * ow;
+          let mut acc = wts[0][off + k * k * c + ch];
+          for ky in 0..k {
+            for kx in 0..k {
+              let iy = oy * s + ky - pt;
+              let ix = ox * s + kx - pl;
+              if iy >= 0 && iy < h && ix >= 0 && ix < w {
+                acc = acc + wts[0][off + (ky * k + kx) * c + ch] * src[0][(iy * w + ix) * c + ch];
+              }
+            }
+          }
+          let mut out = activate(acc, act);
+          if use_res == 1 {
+            out = out + src[0][i];
+          }
+          dst[0][i] = out;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// means[c] = the mean over `npix` pixels of a, plus b when `use_b` is 1.
+fn channel_mean(means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+a : &Tensor<f32, [?, ?], Memory::HBM>, b : &Tensor<f32, [?, ?], Memory::HBM>, npix : i32,
+c : i32, use_b : i32) -> void {
+  spawn on(Topology::Device) {
+    for g in 0..(c + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let ch = g * 256 + l;
+        if ch < c {
+          let mut acc : f32 = 0.0;
+          for p in 0..npix {
+            let mut v = a[0][p * c + ch];
+            if use_b == 1 {
+              v = v + b[0][p * c + ch];
+            }
+            acc = acc + v;
+          }
+          means[0][ch] = acc / (npix as f32);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The squeeze-and-excite gate: gate = sigmoid(W2 relu(W1 means + b1) + b2),
+// with c channels and m hidden ones. Each lane works out the hidden layer again,
+// which costs m * c multiplies and saves a launch.
+fn se_gate(gate : &mut Tensor<f32, [?, ?], Memory::HBM>,
+means : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
+c : i32, m : i32) -> void {
+  spawn on(Topology::Device) {
+    for g in 0..(c + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let co = g * 256 + l;
+        if co < c {
+          let off2 = off + m * c + m;
+          let mut acc = wts[0][off2 + c * m + co];
+          for j in 0..m {
+            let mut hj = wts[0][off + m * c + j];
+            for ci in 0..c {
+              hj = hj + wts[0][off + j * c + ci] * means[0][ci];
+            }
+            acc = acc + wts[0][off2 + co * m + j] * max_f32(hj, 0.0);
+          }
+          gate[0][co] = activate(acc, 3);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// A 1 x 1 convolution of src scaled up 2x (bilinear, half-pixel centres), each
+// tap times gate[ci] when `use_gate` is 1. src is h x w, the output 2h x 2w.
+fn up_pw(dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>,
+gate : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
+h : i32, w : i32, cin : i32, cout : i32, use_gate : i32) -> void {
+  let n = 4 * h * w * cout;
+  spawn on(Topology::Device) {
+    for g in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let i = g * 256 + l;
+        if i < n {
+          let p = i / cout;
+          let co = i - p * cout;
+          let oy = p / (2 * w);
+          let ox = p - oy * (2 * w);
+          let sy = (oy as f32) * 0.5 - 0.25;
+          let sx = (ox as f32) * 0.5 - 0.25;
+          let mut fy0 = sy as i32;
+          if (fy0 as f32) > sy {
+            fy0 = fy0 - 1;
+          }
+          let mut fx0 = sx as i32;
+          if (fx0 as f32) > sx {
+            fx0 = fx0 - 1;
+          }
+          let fy = sy - fy0 as f32;
+          let fx = sx - fx0 as f32;
+          let y0 = clamp_i32(fy0, 0, h - 1);
+          let y1 = clamp_i32(fy0 + 1, 0, h - 1);
+          let x0 = clamp_i32(fx0, 0, w - 1);
+          let x1 = clamp_i32(fx0 + 1, 0, w - 1);
+          let mut acc = wts[0][off + cout * cin + co];
+          for ci in 0..cin {
+            let mut gv : f32 = 1.0;
+            if use_gate == 1 {
+              gv = gate[0][ci];
+            }
+            let v = lerp2(src[0][(y0 * w + x0) * cin + ci] * gv, src[0][(y0 * w + x1) * cin + ci] * gv,
+            src[0][(y1 * w + x0) * cin + ci] * gv, src[0][(y1 * w + x1) * cin + ci] * gv, fx, fy);
+            acc = acc + wts[0][off + co * cin + ci] * v;
+          }
+          dst[0][i] = acc;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The last layer: a 2 x 2 transposed convolution with stride 2 to one channel,
+// then the sigmoid. src is h x w x c, the mask 2h x 2w.
+fn out_tconv(dst : &mut Tensor<f32, [?, ?], Memory::HBM>,
+src : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
+h : i32, w : i32, c : i32) -> void {
+  let n = 4 * h * w;
+  spawn on(Topology::Device) {
+    for g in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes(256) {
+        let i = g * 256 + l;
+        if i < n {
+          let oy = i / (2 * w);
+          let ox = i - oy * (2 * w);
+          let iy = oy / 2;
+          let ix = ox / 2;
+          let ky = oy - iy * 2;
+          let kx = ox - ix * 2;
+          let mut acc = wts[0][off + 4 * c];
+          for ci in 0..c {
+            acc = acc + src[0][(iy * w + ix) * c + ci] * wts[0][off + (ky * 2 + kx) * c + ci];
+          }
+          dst[0][i] = activate(acc, 3);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// mask = the model's 144 x 256 mask resampled to sh x sw.
+fn mask_resample(mask : &mut Tensor<f32, [?, ?], Memory::HBM>,
+mm : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
+  spawn on(Topology::Device) {
+    for y in 0..sh across blocks {
+      for x in 0..sw across lanes(256) {
+        let my = clamp_f32(((y as f32) + 0.5) * 144.0 / (sh as f32) - 0.5, 0.0, 143.0);
+        let mx = clamp_f32(((x as f32) + 0.5) * 256.0 / (sw as f32) - 0.5, 0.0, 255.0);
+        let y0 = my as i32;
+        let x0 = mx as i32;
+        let y1 = min_i32(y0 + 1, 143);
+        let x1 = min_i32(x0 + 1, 255);
+        mask[y][x] = lerp2(mm[0][y0 * 256 + x0], mm[0][y0 * 256 + x1], mm[0][y1 * 256 + x0],
+        mm[0][y1 * 256 + x1], mx - x0 as f32, my - y0 as f32);
+      }
+    }
+  }
+  return;
+}
+
+// One block of the encoder, from x (h x w x cin) to out: expand to `mid`
+// channels, a k x k depthwise conv with stride s, the squeeze-and-excite gate
+// when `se` is not 0 (with `se` hidden channels), then project to cout, and add
+// x when `use_res` is 1. Returns the offset of the next layer's weights.
+fn encoder_block(out : &mut Tensor<f32, [?, ?], Memory::HBM>,
+x : &Tensor<f32, [?, ?], Memory::HBM>, ta : &mut Tensor<f32, [?, ?], Memory::HBM>,
+tb : &mut Tensor<f32, [?, ?], Memory::HBM>, means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+gate : &mut Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>,
+off0 : i32, h : i32, w : i32, cin : i32, mid : i32, cout : i32, k : i32, s : i32, act : i32,
+se : i32, use_res : i32) -> i32 {
+  let mut off = off0;
+  let oh = (h + s - 1) / s;
+  let ow = (w + s - 1) / s;
+  let pt = max_i32((oh - 1) * s + k - h, 0) / 2;
+  let pl = max_i32((ow - 1) * s + k - w, 0) / 2;
+  pw(ta, x, x, x, x, wts, off, h * w, cin, mid, 0, 0, 0, act);
+  off = off + mid * cin + mid;
+  dw(tb, ta, wts, off, h, w, mid, oh, ow, k, s, pt, pl, act, 0);
+  off = off + k * k * mid + mid;
+  let mut use_gate : i32 = 0;
+  if se != 0 {
+    channel_mean(means, tb, tb, oh * ow, mid, 0);
+    se_gate(gate, means, wts, off, mid, se);
+    off = off + se * mid + se + mid * se + mid;
+    use_gate = 1;
+  }
+  pw(out, tb, tb, gate, x, wts, off, oh * ow, mid, cout, use_gate, 0, use_res, 0);
+  return off + cout * mid + cout;
+}
+
+// One stage of the decoder, from x (h x w x cin) and the encoder's skip (2h x
+// 2w x cout): U = a 1 x 1 conv of x scaled up 2x, then the gate of skip + U,
+// V = skip * gate + U, P = relu(1 x 1 conv of V), and out = P + relu(depthwise
+// 3 x 3 conv of P). Returns the offset of the next layer's weights.
+fn decoder_stage(out : &mut Tensor<f32, [?, ?], Memory::HBM>,
+x : &Tensor<f32, [?, ?], Memory::HBM>, skip : &Tensor<f32, [?, ?], Memory::HBM>,
+tu : &mut Tensor<f32, [?, ?], Memory::HBM>, tp : &mut Tensor<f32, [?, ?], Memory::HBM>,
+means : &mut Tensor<f32, [?, ?], Memory::HBM>, gate : &mut Tensor<f32, [?, ?], Memory::HBM>,
+xgate : &Tensor<f32, [?, ?], Memory::HBM>, use_xgate : i32,
+wts : &Tensor<f32, [?, ?], Memory::HBM>, off0 : i32, h : i32, w : i32, cin : i32,
+cout : i32) -> i32 {
+  let mut off = off0;
+  let npix = 4 * h * w;
+  up_pw(tu, x, xgate, wts, off, h, w, cin, cout, use_xgate);
+  off = off + cout * cin + cout;
+  channel_mean(means, skip, tu, npix, cout, 1);
+  se_gate(gate, means, wts, off, cout, cout);
+  off = off + 2 * (cout * cout + cout);
+  pw(tp, skip, tu, gate, skip, wts, off, npix, cout, cout, 1, 1, 0, 1);
+  off = off + cout * cout + cout;
+  dw(out, tp, wts, off, 2 * h, 2 * w, cout, 2 * h, 2 * w, 3, 1, 1, 1, 1, 1);
+  return off + 9 * cout + cout;
+}
+
+// The whole network, from `small` to `mask` (sh x sw). The shell passes slices
+// of one arena for the rest: inp, the encoder's three skips s1 to s3, the work
+// images ta to td, the model's own mask mm, and `means`, `gate` and `gate2`
+// (128 each; gate2 is the gate of the head).
+pub fn vxcam_model(mask : &mut Tensor<f32, [?, ?], Memory::HBM>,
+small : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>,
+inp : &mut Tensor<f32, [?, ?], Memory::HBM>, s1 : &mut Tensor<f32, [?, ?], Memory::HBM>,
+s2 : &mut Tensor<f32, [?, ?], Memory::HBM>, s3 : &mut Tensor<f32, [?, ?], Memory::HBM>,
+ta : &mut Tensor<f32, [?, ?], Memory::HBM>, tb : &mut Tensor<f32, [?, ?], Memory::HBM>,
+tc : &mut Tensor<f32, [?, ?], Memory::HBM>, td : &mut Tensor<f32, [?, ?], Memory::HBM>,
+mm : &mut Tensor<f32, [?, ?], Memory::HBM>, means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+gate : &mut Tensor<f32, [?, ?], Memory::HBM>, gate2 : &mut Tensor<f32, [?, ?], Memory::HBM>,
+sw : i32, sh : i32) -> void {
+  model_input(inp, small, sw, sh);
+  // 144 x 256 x 3 -> 72 x 128 x 16
+  conv_kxk(s1, inp, wts, 0, 144, 256, 3, 72, 128, 16, 3, 2, 0, 0, 2);
+  let mut off : i32 = 16 * 9 * 3 + 16;
+  // The encoder. Activation 1 is relu, 2 is hard swish.
+  off = encoder_block(s2, s1, ta, tb, means, gate, wts, off, 72, 128, 16, 16, 16, 3, 2, 1, 8, 0);
+  off = encoder_block(tc, s2, ta, tb, means, gate, wts, off, 36, 64, 16, 72, 24, 3, 2, 1, 0, 0);
+  off = encoder_block(s3, tc, ta, tb, means, gate, wts, off, 18, 32, 24, 88, 24, 3, 1, 1, 0, 1);
+  off = encoder_block(tc, s3, ta, tb, means, gate, wts, off, 18, 32, 24, 96, 32, 5, 2, 2, 24, 0);
+  off = encoder_block(td, tc, ta, tb, means, gate, wts, off, 9, 16, 32, 128, 32, 5, 1, 2, 32, 1);
+  off = encoder_block(tc, td, ta, tb, means, gate, wts, off, 9, 16, 32, 128, 32, 5, 1, 2, 32, 1);
+  off = encoder_block(td, tc, ta, tb, means, gate, wts, off, 9, 16, 32, 96, 32, 5, 1, 2, 24, 1);
+  off = encoder_block(tc, td, ta, tb, means, gate, wts, off, 9, 16, 32, 96, 32, 5, 1, 2, 24, 1);
+  // The head: relu(1 x 1 conv) of the last block, gated by a sigmoid of its mean.
+  channel_mean(means, tc, tc, 144, 32, 0);
+  pw(ta, tc, tc, tc, tc, wts, off, 144, 32, 128, 0, 0, 0, 1);
+  off = off + 128 * 32 + 128;
+  pw(gate2, means, means, means, means, wts, off, 1, 32, 128, 0, 0, 0, 3);
+  off = off + 128 * 32 + 128;
+  // The decoder: 9 x 16 -> 18 x 32 -> 36 x 64 -> 72 x 128.
+  off = decoder_stage(td, ta, s3, tb, tc, means, gate, gate2, 1, wts, off, 9, 16, 128, 24);
+  off = decoder_stage(ta, td, s2, tb, tc, means, gate, gate2, 0, wts, off, 18, 32, 24, 16);
+  off = decoder_stage(td, ta, s1, tb, tc, means, gate, gate2, 0, wts, off, 36, 64, 16, 16);
+  out_tconv(mm, td, wts, off, 72, 128, 16);
+  mask_resample(mask, mm, sw, sh);
   return;
 }
 

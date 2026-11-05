@@ -163,6 +163,8 @@ final class Pipeline {
   /// The crop window that smooth keeps, and the whole frame for when framing is off.
   private let crop, fullFrame: Shared<Float>
   private let weights: Shared<Float>  // the blur's Gaussian
+  /// The segmentation model's weights and buffers, or nil for the stand-in.
+  private let model: (weights: Shared<Float>, arena: Shared<Float>)?
 
   /// `gpu` names the stages that start on the GPU: "all", or names separated by commas.
   init(w: Int, h: Int, gpu: String = ProcessInfo.processInfo.environment["VXCAM_GPU"] ?? "") {
@@ -184,6 +186,14 @@ final class Pipeline {
     fullFrame.ptr[2] = Float(w)
     fullFrame.ptr[3] = Float(h)
     weights = Shared(count: 6 * blurRadius + 1)
+    let file = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+      .appendingPathComponent("selfie_segmentation_landscape.f32")
+    if ProcessInfo.processInfo.environment["VXCAM_SEGMENT"] != "standin",
+       let data = try? Data(contentsOf: file), data.count == Int(VXCAM_MODEL_WEIGHTS) * 4 {
+      let w = Shared<Float>(count: Int(VXCAM_MODEL_WEIGHTS))
+      data.withUnsafeBytes { _ = memcpy(w.ptr, $0.baseAddress!, data.count) }
+      model = (w, Shared(count: Int(vxcam_model_offset(VXCAM_MODEL_BUFFERS))))
+    } else { model = nil }
     vxcam_gaussian(weights.ptr, Int32(blurRadius))
     let names = Set(gpu.split(separator: ",").map(String.init))
     for i in stages.indices where gpu == "all" || names.contains(stages[i].name) {
@@ -205,7 +215,11 @@ final class Pipeline {
 
   private func runSegment(onGPU: Bool) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
-    vxcam_segment_image(mask.ptr, background.ptr, small.ptr, Int64(sw), Int64(sh), Int64(frameIndex))
+    if let model {
+      vxcam_model_frame(mask.ptr, small.ptr, model.weights.ptr, model.arena.ptr, Int64(sw), Int64(sh))
+    } else {
+      vxcam_segment_image(mask.ptr, background.ptr, small.ptr, Int64(sw), Int64(sh), Int64(frameIndex))
+    }
   }
 
   private func runSmooth(onGPU: Bool) {
@@ -257,6 +271,14 @@ final class Pipeline {
   }
 
   /// A function that puts `buf` back as it is now.
+  /// Writes the model's input and mask, for tools/check_model.py.
+  func dumpModel(_ prefix: String) {
+    guard let a = model?.arena.ptr else { return }
+    for (name, ptr, n) in [("input", vxcam_model_input(a)!, 144 * 256 * 3), ("model", vxcam_model_mask(a)!, 144 * 256)] {
+      FileManager.default.createFile(atPath: "\(prefix)_\(name).f32", contents: Data(bytes: ptr, count: n * 4))
+    }
+  }
+
   private func snapshot<T>(_ buf: Shared<T>) -> () -> Void {
     let saved = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
     saved.update(from: buf.ptr, count: buf.count)
@@ -366,6 +388,7 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
     last = pb
     if let dir, snapshots.contains(i) {
       writePNG(p.image(), to: "\(dir)/frame\(i).png")
+      p.dumpModel("\(dir)/frame\(i)")
       p.mode = 1; p.frameIndex -= 1  // the same frame again, as the mask view
       p.process(pb)
       writePNG(p.image(), to: "\(dir)/frame\(i)_mask.png")

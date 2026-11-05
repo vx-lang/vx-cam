@@ -14,7 +14,7 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | Stage | What it does | Issue |
 | --- | --- | --- |
 | `preprocess` | BGRA8 frame to a 1/4-size RGB f32 image | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
-| `segment` | Person mask. **Stand-in:** background subtraction, not a model | [#3](https://github.com/vx-lang/vx-cam/issues/3) (model on GPU) |
+| `segment` | Person mask from MediaPipe Selfie Segmentation (landscape), a 55-layer network run in Vx. `VXCAM_SEGMENT=standin` uses background subtraction instead | [#3](https://github.com/vx-lang/vx-cam/issues/3) |
 | `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone, and a guided filter that fits the mask to the edges of the image | [#4](https://github.com/vx-lang/vx-cam/issues/4), [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `blur` | Separable Gaussian blur at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
@@ -57,9 +57,21 @@ Each stage gives the same bits on both devices. The numbers say where each stage
   clock. `--headless` reports the median of each stage, so that one switch does not decide the
   numbers. The overlay shows a moving average.
 
-The stand-in segmentation needs a still background and a person who moves, which is what the
-test clip shows. With the camera, step out of view, press `r` so it learns the empty room, and
-step back in. A live camera needs the real model ([#3](https://github.com/vx-lang/vx-cam/issues/3)) to work anywhere.
+The segmentation model is MediaPipe Selfie Segmentation, the landscape version (Google, Apache
+License 2.0; see [models/README.md](models/README.md)). It is written in Vx as 58 kernel launches
+a frame: convolutions, depthwise convolutions, squeeze-and-excite gates and a decoder. Its mask
+matches TFLite's to within 3e-5 on the test clip (`tools/check_model.py`), and is the same to
+the bit on the CPU and the GPU. Its sigmoid uses an `exp` made of `+ - * /` only, so that both
+devices compute the same bits. On the M4, `segment` takes about 6 ms on the CPU and 21 ms on
+the GPU: on the GPU it is 58 waits of the kind that
+[vx-lang/Vx#2781](https://github.com/vx-lang/Vx/issues/2781) would remove. So it belongs on the
+CPU for now. The table above is from before the model.
+
+The model was trained on photos of real people, and the test clip is a drawing, so on the clip
+it finds the head more surely than the body. The smoothing and the guided filter fill in the
+rest. `VXCAM_SEGMENT=standin` runs the old stand-in, background subtraction: it needs a still
+background and a person who moves. With it and the camera, step out of view, press `r` so it
+learns the empty room, and step back in.
 
 ## Build and run
 
@@ -90,6 +102,9 @@ stage between the CPU and the GPU, `r` learn the background again, `o` overlay, 
 | `shell/main.swift` | The host shell: video file or camera in, window, overlay, keys. No compute |
 | `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera |
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
+| `models/` | The segmentation model's weights, its license and where it comes from |
+| `tools/convert_model.py` | Writes those weights from Google's .tflite file |
+| `tools/check_model.py` | Compares vx-cam's mask with TFLite's, on the frames that `--headless` writes |
 
 The shell owns every buffer and passes it to Vx as a tensor. It times each stage call for the
 overlay. "Bytes moved" is 0: no stage copies a buffer, on either device. The host code at the

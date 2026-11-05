@@ -14,7 +14,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 
 .PHONY: all run camera check clean
 
-all: build/vx-cam build/test_clip.mov
+all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
 build/vxcam.o: pipeline/vxcam.vx | build
 	cd $(VX) && . $(VX_CONFIG) && $(VXC) $(CURDIR)/$< --host default --machine fleet/m4-uma.vx \
@@ -25,6 +25,10 @@ build/vxcam.o: pipeline/vxcam.vx | build
 build/vx-cam: shell/main.swift shell/Info.plist pipeline/vxcam.h build/vxcam.o
 	swiftc -O -import-objc-header pipeline/vxcam.h shell/main.swift build/vxcam.o $(LIBS) \
 	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker shell/Info.plist -o $@
+
+# The segmentation model's weights go next to the binary (models/README.md).
+build/selfie_segmentation_landscape.f32: models/selfie_segmentation_landscape.f32 | build
+	cp $< $@
 
 build/make_test_clip: tools/make_test_clip.swift | build
 	swiftc -O -suppress-warnings $< -o $@
