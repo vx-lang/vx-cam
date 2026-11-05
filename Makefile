@@ -1,9 +1,9 @@
 # vx-cam build. `make run` builds everything and plays the test clip.
 #
-# VX is a checkout of the Vx compiler (https://github.com/vx-lang/Vx) with vxc built. The GPU
-# stages need its Metal backend (open PRs until they merge; the README names them), so the
-# default is that checkout. vxc reads its standard library from the checkout, so it runs from there.
-VX ?= $(HOME)/go/Vx-metal-backend
+# VX is a checkout of the Vx compiler (https://github.com/vx-lang/Vx) with vxc built, from a
+# main that has the Metal backend (2026-11-05 or later). vxc reads its standard library from
+# the checkout, so it runs from there.
+VX ?= $(HOME)/go/Vx
 VX_CONFIG ?= $(HOME)/go/Vx/config.local
 VXC = $(VX)/target/debug/vxc
 # The dispatch library holds the Metal runtime. Cargo keeps one copy per build; take the newest.
