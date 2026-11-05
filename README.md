@@ -17,7 +17,7 @@ separated by commas, such as `VXCAM_GPU=blur,composite`).
 | `segment` | Person mask from MediaPipe Selfie Segmentation (landscape), a 55-layer network run in Vx. `VXCAM_SEGMENT=standin` uses background subtraction instead | [#3](https://github.com/vx-lang/vx-cam/issues/3) |
 | `smooth` | Temporal mask smoothing, bounding box, crop window with a dead zone, and a guided filter that fits the mask to the edges of the image | [#4](https://github.com/vx-lang/vx-cam/issues/4), [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 | `blur` | Separable Gaussian blur at 1/4 size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
-| `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
+| `composite` | Crop and zoom, then mix sharp person and blurred background by the guided mask at full size. It can draw a green line where the mask crosses 0.5 | [#2](https://github.com/vx-lang/vx-cam/issues/2) |
 
 On the M4 (10 cores), the median over the 360 frames of the test clip, from the middle run of
 five. Other sessions' builds were running on the machine. With less of that, all on the CPU
@@ -90,13 +90,15 @@ make check    # run the whole clip on the CPU, then with the kernels on the GPU;
               # stage tables, compare each GPU stage with its CPU copy bit for bit, and
               # write snapshots (output and mask view) to build/snapshots
 make run CLIP=record-1.mov    # the same with your own recording (1280x720, landscape)
-make video CLIP=record-1.mov  # write the output, blurred and framed, to build/out.mov
+make video CLIP=record-1.mov  # write build/outline.mov (the output with the mask's outline) and
+                              # build/mask.mov (the mask view), each with a panel of where
+                              # each stage runs and how long it takes
 ```
 
 To record a clip, use QuickTime Player (File > New Movie Recording) and save it in this
 folder. `.gitignore` keeps `*.mov` files here out of git.
 
-Keys in the window: `m` mask view, `b` blur off, `f` auto-framing off, `1`-`5` move a
+Keys in the window: `m` mask view, `l` outline, `b` blur off, `f` auto-framing off, `1`-`5` move a
 stage between the CPU and the GPU, `r` learn the background again (stand-in only), `o` overlay,
 space pause, `q` quit.
 

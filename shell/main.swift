@@ -8,7 +8,9 @@
 //   vx-cam --camera                        run on the default camera in a window
 //   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table (medians),
 //                                          and write a few frames as PNG to dir
-//   vx-cam <clip.mov> --write out.mov      run every frame once and write the output to out.mov
+//   vx-cam <clip.mov> --write out.mov [mask] [outline] [panel]
+//                                          run every frame once and write the output to out.mov:
+//                                          the mask view, the mask's outline, the stage panel
 import AVFoundation
 import AppKit
 import CoreVideo
@@ -155,6 +157,7 @@ final class Pipeline {
   var frameIndex = 0
   var mode = 0            // 0 normal, 1 mask, 2 no blur
   var autoFraming = true
+  var outline = false     // a green line where the mask crosses 0.5
   let blurRadius = 4  // the sigma of the Gaussian blur, in small pixels
   /// Every stage is GPU kernels, and each can run on either device.
   var stages = ["preprocess", "segment", "smooth", "blur", "composite"].map { StageInfo(name: $0) }
@@ -241,9 +244,10 @@ final class Pipeline {
                      Int32(blurRadius))
   }
 
-  private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool) {
+  private func runComposite(_ frame: UnsafePointer<UInt8>, _ stride: Int, onGPU: Bool, outline: Bool? = nil) {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     let window = autoFraming ? crop : fullFrame
+    let mode = self.mode + ((outline ?? self.outline) ? 3 : 0)
     vxcam_composite_frame(out.ptr, frame, blurred.ptr, ab.ptr, window.ptr, Int64(w), Int64(h),
                           Int64(stride), Int32(scale), Int32(mode))
   }
@@ -313,6 +317,9 @@ final class Pipeline {
       compare("smooth guide", ab, fills: [-1], { Double($0) }, reset: restoreSmooth) { runSmooth(onGPU: $0) },
       compare("blur", blurred, fills: [-1], { Double($0) }) { runBlur(onGPU: $0) },
       compare("composite", out, fills: [0x00, 0xFF], { Double($0) }) { runComposite(frame, stride, onGPU: $0) },
+      compare("composite outline", out, fills: [0x00, 0xFF], { Double($0) }) {
+        runComposite(frame, stride, onGPU: $0, outline: true)
+      },
     ]
   }
 
@@ -366,7 +373,7 @@ final class Pipeline {
     s += String(format: "frame       %6.2f ms of %.1f ms budget (%@)\n", frameMs, budget,
                 frameMs <= budget ? "fits" : "over")
     let modes = ["blur", "mask", "no blur"]
-    s += "view: \(modes[mode])   framing: \(autoFraming ? "auto" : "off")"
+    s += "view: \(modes[mode])\(outline ? " + outline" : "")   framing: \(autoFraming ? "auto" : "off")"
     return note.isEmpty ? s : s + "\n" + note
   }
 }
@@ -416,11 +423,14 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
 }
 
 /// Runs every frame of the clip once and writes the output frames to a movie, at their times.
-func runWrite(source: VideoSource, to path: String) {
+/// `options` may hold "mask" (the mask view), "outline" and "panel" (drawPanel).
+func runWrite(source: VideoSource, to path: String, options: Set<String>) {
   source.loops = false
   guard let first = source.next() else { fatalError("the clip has no frames") }
   let (w, h) = (CVPixelBufferGetWidth(first), CVPixelBufferGetHeight(first))
   let p = Pipeline(w: w, h: h)
+  p.mode = options.contains("mask") ? 1 : 0
+  p.outline = options.contains("outline")
   let url = URL(fileURLWithPath: path)
   try? FileManager.default.removeItem(at: url)
   guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { fatalError("cannot write \(path)") }
@@ -446,6 +456,7 @@ func runWrite(source: VideoSource, to path: String) {
     let dst = CVPixelBufferGetBaseAddress(frame)!, rowBytes = CVPixelBufferGetBytesPerRow(frame)
     for y in 0..<h { memcpy(dst + y * rowBytes, p.out.ptr + y * w * 4, w * 4) }
     CVPixelBufferUnlockBaseAddress(frame, [])
+    if options.contains("panel") { drawPanel(on: frame, p, fps: source.fps) }
     while !input.isReadyForMoreMediaData { usleep(1000) }
     adaptor.append(frame, withPresentationTime: source.time)
     n += 1
@@ -457,6 +468,65 @@ func runWrite(source: VideoSource, to path: String) {
   done.wait()
   guard writer.status == .completed else { fatalError("writing \(path) failed: \(String(describing: writer.error))") }
   print("wrote \(n) frames to \(path)")
+}
+
+/// Draws on a BGRA frame where each stage runs and how long it takes (moving averages), and
+/// the frame as a strip of CPU and GPU time against the budget.
+func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
+  CVPixelBufferLockBaseAddress(pb, [])
+  defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+  guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: p.w, height: p.h,
+                            bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                              | CGBitmapInfo.byteOrder32Little.rawValue) else { return }
+  let cpu = CGColor(red: 0.32, green: 0.62, blue: 1.0, alpha: 1)
+  let gpu = CGColor(red: 1.0, green: 0.62, blue: 0.12, alpha: 1)
+  let white = CGColor(gray: 1, alpha: 1), dim = CGColor(gray: 1, alpha: 0.7), black = CGColor(gray: 0, alpha: 1)
+  func text(_ s: String, _ x: Double, _ y: Double, _ color: CGColor, size: CGFloat = 16, bold: Bool = false) {
+    let font = CTFontCreateWithName((bold ? "Menlo-Bold" : "Menlo-Regular") as CFString, size, nil)
+    let attrs = [NSAttributedString.Key(kCTFontAttributeName as String): font,
+                 NSAttributedString.Key(kCTForegroundColorAttributeName as String): color] as [NSAttributedString.Key: Any]
+    ctx.textMatrix = .identity
+    ctx.textPosition = CGPoint(x: x, y: y)
+    CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: attrs)), ctx)
+  }
+  func box(_ r: CGRect, _ color: CGColor, radius: Double = 4) {
+    ctx.setFillColor(color)
+    ctx.addPath(CGPath(roundedRect: r, cornerWidth: radius, cornerHeight: radius, transform: nil))
+    ctx.fillPath()
+  }
+  // CG's origin is the bottom left; the panel hangs from the top left.
+  let budget = 1000 / fps, x0 = 28.0, row = 27.0, strip = 440.0
+  let top = Double(p.h) - 20
+  box(CGRect(x: x0 - 14, y: top - row * 9.6, width: strip + 28, height: row * 9.6), CGColor(gray: 0, alpha: 0.62), radius: 10)
+  var y = top - row
+  text("Each stage is Vx, on the CPU or the GPU", x0, y, white, size: 16, bold: true)
+  for st in p.stages {
+    y -= row
+    let color = st.device == "GPU" ? gpu : cpu
+    text(st.name, x0, y, white)
+    box(CGRect(x: x0 + 124, y: y - 5, width: 46, height: 22), color)
+    text(st.device, x0 + 131, y, black, size: 15, bold: true)
+    box(CGRect(x: x0 + 182, y: y - 3, width: max(2, 180 * min(st.ms / budget, 1)), height: 16), color, radius: 2)
+    text(String(format: "%5.2f ms", st.ms), x0 + 370, y, white)
+  }
+  y -= row * 1.3
+  text(String(format: "one frame: %.1f ms of the %.1f ms budget", p.frameMs, budget), x0, y, white)
+  y -= row
+  // The stages run in turn: the CPU waits for each GPU stage, and hands over its buffers in place.
+  ctx.setStrokeColor(dim)
+  ctx.stroke(CGRect(x: x0, y: y - 5, width: strip, height: 22), width: 1)
+  var x = x0
+  for st in p.stages {
+    let wide = strip * min(st.ms / budget, 1)
+    box(CGRect(x: x, y: y - 5, width: max(wide - 1, 1), height: 22), st.device == "GPU" ? gpu : cpu, radius: 0)
+    let label = String(st.name.prefix(wide > 70 ? 7 : 3))
+    if wide > 30 { text(label, x + 4, y, black, size: 13, bold: true) }
+    x += wide
+  }
+  y -= row
+  text("CPU and GPU share memory: 0 bytes copied", x0, y, dim, size: 14)
 }
 
 // MARK: - Window
@@ -500,7 +570,7 @@ final class App: NSObject, NSApplicationDelegate {
     view.layer!.addSublayer(overlay)
     view.onKey = { [weak self] k in self?.key(k) }
     window.contentView = view
-    window.title = "vx-cam  ·  keys: m mask  b blur  f framing  1-5 device  r relearn  o overlay  space pause  q quit"
+    window.title = "vx-cam  ·  keys: m mask  l outline  b blur  f framing  1-5 device  r relearn  o overlay  space pause  q quit"
     window.center()
     window.makeKeyAndOrderFront(nil)
     window.makeFirstResponder(view)
@@ -530,6 +600,7 @@ final class App: NSObject, NSApplicationDelegate {
       guard let p = pipeline else { return }
       switch k {
       case "m": p.mode = p.mode == 1 ? 0 : 1
+      case "l": p.outline.toggle()
       case "b": p.mode = p.mode == 2 ? 0 : 2
       case "f": p.autoFraming.toggle()
       case "r":  // learn the background again from the next frame
@@ -550,7 +621,7 @@ final class App: NSObject, NSApplicationDelegate {
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-  print("usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov]  |  vx-cam --camera")
+  print("usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel]]  |  vx-cam --camera")
   exit(2)
 }
 let source: FrameSource
@@ -563,7 +634,7 @@ if args[1] == "--camera" {
     exit(0)
   }
   if args.count >= 4 && args[2] == "--write" {
-    runWrite(source: clip, to: args[3])
+    runWrite(source: clip, to: args[3], options: Set(args.dropFirst(4)))
     exit(0)
   }
   source = clip

@@ -44,10 +44,14 @@ build/test_clip.mov: build/make_test_clip
 run: all
 	./build/vx-cam $(CLIP)
 
-# Writes the clip with the background blurred and the auto-framing to build/out.mov, without a
-# window. Every frame runs once.
+# Writes two movies of the clip, without a window, every frame once: build/outline.mov, the
+# output (background blurred, auto-framing) with a green line where the mask's edge is, and
+# build/mask.mov, the mask view with the same line. A panel shows where each stage runs and
+# how long it takes. VIDEO_GPU names the stages on the GPU.
+VIDEO_GPU ?= preprocess,blur,composite
 video: all
-	./build/vx-cam $(CLIP) --write build/out.mov
+	VXCAM_GPU=$(VIDEO_GPU) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
+	VXCAM_GPU=$(VIDEO_GPU) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
 
 # The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
 # of view and press r, so the stand-in learns the empty room, then step back in.

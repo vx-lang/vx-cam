@@ -1049,13 +1049,46 @@ weights : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, radius : i3
 //===----------------------------------------------------------------------===//
 // Stage 5: composite. For each output pixel, find where it comes from inside the
 // crop window, then mix the sharp frame and the blurred background by the mask.
-// `mode` 0 is the normal output, 1 shows the mask, 2 turns the blur off.
+// `mode` 0 is the normal output, 1 shows the mask, 2 turns the blur off. 3 to 5
+// are the same with a green outline where the mask crosses 0.5.
 //
 // A GPU kernel, one lane per output pixel. `frame` is `[h, stride]` bytes as in
 // preprocess, `out` is `[h, 4 * w]` BGRA bytes, `blurred` is `[sh, 3 * sw]` and
 // `ab` is `[sh, 2 * sw]`, the guided filter's a and b from smooth. The mask at a
 // pixel is a * I + b, where I is the gray of the sharp frame there.
 //===----------------------------------------------------------------------===//
+
+// The mask at output pixel (ox, oy), as composite_kernel computes it: a * I + b
+// where the pixel comes from.
+fn mask_at(frame : &Tensor<u8, [?, ?], Memory::HBM>, ab : &Tensor<f32, [?, ?], Memory::HBM>,
+x0 : f32, y0 : f32, kx : f32, ky : f32, inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32,
+ox : i32, oy : i32) on Topology::Device -> f32
+ensures reads_only(frame)
+ensures reads_only(ab)
+{
+  let sy = clamp_f32(y0 + ((oy as f32) + 0.5) * ky - 0.5, 0.0, (h - 1) as f32);
+  let iy0 = sy as i32;
+  let iy1 = min_i32(iy0 + 1, h - 1);
+  let fy = sy - iy0 as f32;
+  let v = clamp_f32((sy + 0.5) * inv_scale - 0.5, 0.0, (sh - 1) as f32);
+  let vy0 = v as i32;
+  let vy1 = min_i32(vy0 + 1, sh - 1);
+  let gy = v - vy0 as f32;
+  let sx = clamp_f32(x0 + ((ox as f32) + 0.5) * kx - 0.5, 0.0, (w - 1) as f32);
+  let ix0 = sx as i32;
+  let ix1 = min_i32(ix0 + 1, w - 1);
+  let fx = sx - ix0 as f32;
+  let u = clamp_f32((sx + 0.5) * inv_scale - 0.5, 0.0, (sw - 1) as f32);
+  let ux0 = u as i32;
+  let ux1 = min_i32(ux0 + 1, sw - 1);
+  let gx = u - ux0 as f32;
+  let sb = sample_u8(frame, iy0, iy1, ix0 * 4, ix1 * 4, fx, fy);
+  let sg = sample_u8(frame, iy0, iy1, ix0 * 4 + 1, ix1 * 4 + 1, fx, fy);
+  let sr = sample_u8(frame, iy0, iy1, ix0 * 4 + 2, ix1 * 4 + 2, fx, fy);
+  let a = sample_f32(ab, vy0, vy1, ux0 * 2, ux1 * 2, gx, gy);
+  let b = sample_f32(ab, vy0, vy1, ux0 * 2 + 1, ux1 * 2 + 1, gx, gy);
+  return clamp_f32(a * gray(sr, sg, sb) / 255.0 + b, 0.0, 1.0);
+}
 
 // The window's corner is (x0, y0) in frame pixels, and kx, ky scale output
 // pixels to frame pixels. `inv_scale` is 1 / scale, from frame pixels to small
@@ -1091,6 +1124,33 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
         let a = sample_f32(ab, vy0, vy1, ux0 * 2, ux1 * 2, gx, gy);
         let b = sample_f32(ab, vy0, vy1, ux0 * 2 + 1, ux1 * 2 + 1, gx, gy);
         let m = clamp_f32(a * gray(sr, sg, sb) / 255.0 + b, 0.0, 1.0);
+        // The outline: a pixel whose neighbour one pixel away is on the other side of
+        // m = 0.5. The line is two pixels wide.
+        let mut view = mode;
+        let mut edge = 0;
+        if mode >= 3 {
+          view = mode - 3;
+          for k in 0..4 {
+            let mut nx = ox;
+            let mut ny = oy;
+            if k == 0 {
+              nx = min_i32(ox + 1, w - 1);
+            }
+            if k == 1 {
+              nx = max_i32(ox - 1, 0);
+            }
+            if k == 2 {
+              ny = min_i32(oy + 1, h - 1);
+            }
+            if k == 3 {
+              ny = max_i32(oy - 1, 0);
+            }
+            let n = mask_at(frame, ab, x0, y0, kx, ky, inv_scale, w, h, sw, sh, nx, ny);
+            if (n >= 0.5) != (m >= 0.5) {
+              edge = 1;
+            }
+          }
+        }
         for c in 0..3 {
           let mut sharp = sb;
           if c == 1 {
@@ -1102,11 +1162,18 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
           let k = 2 - c;
           let soft = 255.0 * sample_f32(blurred, vy0, vy1, ux0 * 3 + k, ux1 * 3 + k, gx, gy);
           let mut value = sharp;
-          if mode == 0 {
+          if view == 0 {
             value = soft + m * (sharp - soft);
           }
-          if mode == 1 {
+          if view == 1 {
             value = 0.25 * sharp + 0.75 * 255.0 * m;
+          }
+          if edge == 1 {
+            // Green, BGR.
+            value = 80.0;
+            if c == 1 {
+              value = 255.0;
+            }
           }
           out[oy][ox * 4 + c] = (clamp_f32(value, 0.0, 255.0) + 0.5) as u8;
         }
