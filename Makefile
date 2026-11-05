@@ -17,7 +17,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 # folder (*.mov) stay out of git.
 CLIP ?= build/test_clip.mov
 
-.PHONY: all run video camera check clean
+.PHONY: all run video camera check bench clean
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
@@ -47,11 +47,13 @@ run: all
 # Writes two movies of the clip, without a window, every frame once: build/outline.mov, the
 # output (background blurred, auto-framing) with a green line where the mask's edge is, and
 # build/mask.mov, the mask view with the same line. A panel shows where each stage runs and
-# how long it takes. VIDEO_GPU names the stages on the GPU.
-VIDEO_GPU ?= preprocess,blur,composite
+# how long it takes. VIDEO_GPU names the stages on the GPU. With VIDEO_OVERLAP=1, the CPU
+# starts the next frame while the GPU finishes this one, and the panel shows the two lanes.
+VIDEO_GPU ?= blur,composite
+VIDEO_OVERLAP ?= 1
 video: all
-	VXCAM_GPU=$(VIDEO_GPU) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
-	VXCAM_GPU=$(VIDEO_GPU) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
+	VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
+	VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
 
 # The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
 # of view and press r, so the stand-in learns the empty room, then step back in.
@@ -66,6 +68,18 @@ check: all
 	mkdir -p build/snapshots
 	./build/vx-cam $(CLIP) --headless 360 build/snapshots
 	VXCAM_GPU=all ./build/vx-cam $(CLIP) --headless 360
+
+# Measures vx-cam and writes build/bench/report.md and results.json (tools/bench.py): the same
+# bits on both devices, every placement, frames overlapping, launches and copies. BENCH_ALSO adds
+# a second clip, such as a recording. With TFLITE (the original .tflite, see models/README.md)
+# and BENCH_PYTHON (a Python with ai-edge-litert, tflite and coremltools), it also checks the
+# model against TFLite and times it in TFLite and Core ML. About 40 minutes, on a quiet machine.
+BENCH_ALSO ?=
+TFLITE ?=
+BENCH_PYTHON ?= python3
+bench: all
+	python3 tools/bench.py --clip build/test_clip.mov $(if $(BENCH_ALSO),--also $(BENCH_ALSO)) \
+	  $(if $(TFLITE),--tflite $(TFLITE) --python $(BENCH_PYTHON))
 
 build:
 	mkdir -p build
