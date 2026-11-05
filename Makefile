@@ -12,6 +12,11 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
   -framework Metal -framework Foundation -framework Accelerate \
   -framework MetalPerformanceShaders -framework CoreML
 
+# The clip that `make run` and `make check` play. The default is drawn by tools/make_test_clip.swift.
+# A recording of your own works too: `make run CLIP=record-1.mov`. Recordings in the top
+# folder (*.mov) stay out of git.
+CLIP ?= build/test_clip.mov
+
 .PHONY: all run camera check clean
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
@@ -37,7 +42,7 @@ build/test_clip.mov: build/make_test_clip
 	./build/make_test_clip $@
 
 run: all
-	./build/vx-cam build/test_clip.mov
+	./build/vx-cam $(CLIP)
 
 # The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
 # of view and press r, so the stand-in learns the empty room, then step back in.
@@ -50,8 +55,8 @@ camera: build/vx-cam
 # snapshots (frame and mask view) to build/snapshots.
 check: all
 	mkdir -p build/snapshots
-	./build/vx-cam build/test_clip.mov --headless 360 build/snapshots
-	VXCAM_GPU=all ./build/vx-cam build/test_clip.mov --headless 360
+	./build/vx-cam $(CLIP) --headless 360 build/snapshots
+	VXCAM_GPU=all ./build/vx-cam $(CLIP) --headless 360
 
 build:
 	mkdir -p build

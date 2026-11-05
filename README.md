@@ -89,7 +89,11 @@ make camera   # run on the default camera in a window (macOS asks for permission
 make check    # run the whole clip on the CPU, then with the kernels on the GPU; print the
               # stage tables, compare each GPU stage with its CPU copy bit for bit, and
               # write snapshots (output and mask view) to build/snapshots
+make run CLIP=record-1.mov    # the same with your own recording (1280x720, landscape)
 ```
+
+To record a clip, use QuickTime Player (File > New Movie Recording) and save it in this
+folder. `.gitignore` keeps `*.mov` files here out of git.
 
 Keys in the window: `m` mask view, `b` blur off, `f` auto-framing off, `1`-`5` move a
 stage between the CPU and the GPU, `r` learn the background again (stand-in only), `o` overlay,
