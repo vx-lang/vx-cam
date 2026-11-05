@@ -126,7 +126,9 @@ two or three threads:
   split the stages gain more, such as blur and composite on the GPU: 9.18 ms against 11.58 ms
   (1.26x). One loses: segment alone on the GPU, 18.37 ms against 12.11 ms. Overlap is also
   uneven: all on the GPU, one run of five took 21.23 ms, and that happens again outside
-  `make bench`. The cause is not known yet.
+  `make bench`. A slow run makes the same launches and waits as a fast one (6 waits a frame),
+  but partway through, every GPU stage starts taking 2.2 to 2.7 times as long on the GPU itself.
+  So the GPU's clock drops, likely at the power limit of the fanless Air, as below.
 - `VXCAM_ALTERNATE=1`: the model runs on the GPU for the even frames and on the CPU for the odd
   ones, on two threads, while a third runs smooth, blur and composite on each frame in order. The
   output is the same to the bit, because the two devices compute the same bits. In the same
