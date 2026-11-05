@@ -53,12 +53,15 @@ run: all
 # build/mask.mov, the mask view with the same line. A panel shows where each stage runs and
 # how long it takes. VIDEO_GPU names the stages on the GPU; the default was the fastest in make
 # bench. With VIDEO_OVERLAP=1, one thread starts the next frame while a second finishes this one,
-# and the panel shows the two lanes.
+# and the panel shows the two lanes. With VIDEO_ALTERNATE=1, the model runs on the GPU for even
+# frames and on the CPU for odd ones, at the same time, and the panel shows both.
 VIDEO_GPU ?= segment,smooth,blur,composite
 VIDEO_OVERLAP ?= 1
+VIDEO_ALTERNATE ?= 0
+VIDEO_ENV = VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) VXCAM_ALTERNATE=$(VIDEO_ALTERNATE)
 video: all
-	VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
-	VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
+	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
+	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
 
 # The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
 # of view and press r, so the stand-in learns the empty room, then step back in.

@@ -365,20 +365,30 @@ final class Pipeline {
     ]
   }
 
-  /// Records one frame's stage times, and its whole time, in the moving averages.
-  func record(_ times: [Double], frame ms: Double) {
+  /// Records one frame's stage times, and its whole time, in the moving averages. While the
+  /// model alternates, `modelOnGPU` says where this frame's preprocess and segment ran, and their
+  /// times go to that device's averages (`alternating`).
+  func record(_ times: [Double], frame ms: Double, modelOnGPU: Bool? = nil) {
+    func ease(_ old: Double, _ new: Double) -> Double { old == 0 ? new : old * 0.9 + new * 0.1 }
     let first = recorded == 0
     recorded += 1
     for i in stages.indices {
       stages[i].last = times[i]
-      stages[i].ms = first ? times[i] : stages[i].ms * 0.9 + times[i] * 0.1
+      if i < 2, let gpu = modelOnGPU, alternating != nil {
+        alternating![gpu ? 0 : 1][i] = ease(alternating![gpu ? 0 : 1][i], times[i])
+      } else {
+        stages[i].ms = first ? times[i] : ease(stages[i].ms, times[i])
+      }
     }
     lastFrameMs = ms
-    frameMs = first ? ms : frameMs * 0.9 + ms * 0.1
+    frameMs = first ? ms : ease(frameMs, ms)
   }
   private var recorded = 0
   /// Set while runOverlapped runs: the stages on each of its two threads, for the panel.
   var lanes: (front: [Int], back: [Int])?
+  /// Set while runAlternating runs: the moving averages of preprocess and segment on the GPU
+  /// (first) and on the CPU, for the panel.
+  var alternating: [[Double]]?
 
   /// Runs the five stages on `pb` one after another, in slot 0.
   func process(_ pb: CVPixelBuffer) {
@@ -512,6 +522,7 @@ func runOverlapped(_ p: Pipeline, _ source: VideoSource, frames: Int,
 func runAlternating(_ p: Pipeline, _ source: VideoSource, frames: Int,
                     after: @escaping ([Double], CVPixelBuffer, CMTime) -> Void) -> (wall: Double, busy: [Double]) {
   precondition(p.hasModel, "the model alternates between the devices, so the stand-in cannot (VXCAM_SEGMENT)")
+  p.alternating = [[0, 0], [0, 0]]
   let n = Pipeline.slots
   final class Hand { var frame: (pb: CVPixelBuffer, time: CMTime)?; var times = [Double](repeating: 0, count: 5) }
   final class Busy { var ms = 0.0 }  // one for each thread, so no two threads write the same one
@@ -678,7 +689,8 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
 }
 
 /// Runs every frame of the clip once and writes the output frames to a movie, at their times.
-/// `options` may hold "mask" (the mask view), "outline" and "panel" (drawPanel).
+/// `options` may hold "mask" (the mask view), "outline" and "panel" (drawPanel). VXCAM_OVERLAP=1
+/// and VXCAM_ALTERNATE=1 run the frames as in runHeadless.
 func runWrite(source: VideoSource, to path: String, options: Set<String>) {
   source.loops = false
   guard let first = source.next() else { fatalError("the clip has no frames") }
@@ -716,9 +728,17 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
   }
   p.process(first)
   emit(source.time)
-  if env("VXCAM_OVERLAP") == "1" {
-    // The panel's frame time is the time between frames, while the stages of two frames overlap.
-    var lastDone = nowMs()
+  // With more than one frame in flight, the panel's frame time is the time between frames.
+  var lastDone = nowMs(), k = 0
+  if env("VXCAM_ALTERNATE") == "1" {
+    _ = runAlternating(p, source, frames: Int.max) { times, _, time in
+      let done = nowMs()
+      p.record(times, frame: done - lastDone, modelOnGPU: k % 2 == 0)  // frames come out in order
+      lastDone = done
+      k += 1
+      emit(time)
+    }
+  } else if env("VXCAM_OVERLAP") == "1" {
     _ = runOverlapped(p, source, frames: Int.max) { times, _, time in
       let done = nowMs()
       p.record(times, frame: done - lastDone)
@@ -765,46 +785,72 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
     ctx.addPath(CGPath(roundedRect: r, cornerWidth: radius, cornerHeight: radius, transform: nil))
     ctx.fillPath()
   }
+  // One after another, the stages of a frame run in turn, in one lane, and the CPU waits for each
+  // GPU stage. With frames overlapping, two lanes run at the same time: the first stages of the
+  // next frame, and the last ones of this frame. With the model alternating, the GPU runs it for
+  // even frames while the CPU runs it for odd ones, and a third lane takes the frames in order.
+  // Either way the buffers pass over in place. A lane is a label and its stages: each a name, a
+  // time and whether it runs on the GPU.
+  typealias Lane = (label: String, stages: [(name: String, ms: Double, gpu: Bool)])
+  func lane(_ label: String, _ ks: [Int]) -> Lane {
+    (label, ks.map { (p.stages[$0].name, p.stages[$0].ms, p.stages[$0].device == "GPU") })
+  }
+  var lanes: [Lane]
+  if let a = p.alternating {
+    lanes = [("even frames", [0, 1].map { (p.stages[$0].name, a[0][$0], true) }),
+             ("odd frames", [0, 1].map { (p.stages[$0].name, a[1][$0], false) }),
+             lane("in order", [2, 3, 4])]
+  } else if let l = p.lanes {
+    lanes = [lane("next frame", l.front), lane("this frame", l.back)]
+  } else {
+    lanes = [lane("", Array(p.stages.indices))]
+  }
   // CG's origin is the bottom left; the panel hangs from the top left.
   let budget = 1000 / fps, x0 = 28.0, row = 27.0, strip = 440.0
-  let top = Double(p.h) - 20, tall = row * (p.lanes == nil ? 9.6 : 10.6)
+  let top = Double(p.h) - 20, tall = row * (8.6 + Double(lanes.count))
   box(CGRect(x: x0 - 14, y: top - tall, width: strip + 28, height: tall), CGColor(gray: 0, alpha: 0.62), radius: 10)
   var y = top - row
   text("Each stage is Vx, on the CPU or the GPU", x0, y, white, size: 16, bold: true)
-  for st in p.stages {
+  func badge(_ onGPU: Bool, _ x: Double) {
+    box(CGRect(x: x, y: y - 5, width: 46, height: 22), onGPU ? gpu : cpu)
+    text(onGPU ? "GPU" : "CPU", x + 7, y, black, size: 15, bold: true)
+  }
+  for (i, st) in p.stages.enumerated() {
     y -= row
-    let color = st.device == "GPU" ? gpu : cpu
     text(st.name, x0, y, white)
-    box(CGRect(x: x0 + 124, y: y - 5, width: 46, height: 22), color)
-    text(st.device, x0 + 131, y, black, size: 15, bold: true)
-    box(CGRect(x: x0 + 182, y: y - 3, width: max(2, 180 * min(st.ms / budget, 1)), height: 16), color, radius: 2)
+    if let a = p.alternating, i < 2 {  // on both devices, with each one's time
+      badge(true, x0 + 124)
+      badge(false, x0 + 176)
+      text(String(format: "%5.2f | %5.2f ms", a[0][i], a[1][i]), x0 + 236, y, white)
+      continue
+    }
+    badge(st.device == "GPU", x0 + 124)
+    box(CGRect(x: x0 + 182, y: y - 3, width: max(2, 180 * min(st.ms / budget, 1)), height: 16),
+        st.device == "GPU" ? gpu : cpu, radius: 2)
     text(String(format: "%5.2f ms", st.ms), x0 + 370, y, white)
   }
   y -= row * 1.3
-  text(String(format: p.lanes == nil ? "one frame: %.1f ms of the %.1f ms budget"
-                                     : "a frame every %.1f ms (budget %.1f ms)", p.frameMs, budget), x0, y, white)
+  text(String(format: lanes.count == 1 ? "one frame: %.1f ms of the %.1f ms budget"
+                                       : "a frame every %.1f ms (budget %.1f ms)", p.frameMs, budget), x0, y, white)
   y -= row
-  // One after another, the stages of a frame run in turn, and the CPU waits for each GPU stage.
-  // With frames overlapping, the two lanes run at the same time: the first stages of the next
-  // frame, and the last ones of this frame. Either way the buffers pass over in place.
-  let lanes = p.lanes.map { [("next frame", $0.front), ("this frame", $0.back)] } ?? [("", Array(p.stages.indices))]
-  let laneX = p.lanes == nil ? x0 : x0 + 104, laneW = strip - (laneX - x0)
+  let laneX = lanes.count == 1 ? x0 : x0 + 104, laneW = strip - (laneX - x0)
   ctx.setStrokeColor(dim)
   for (label, stages) in lanes {
     if !label.isEmpty { text(label, x0, y, dim, size: 14) }
     ctx.stroke(CGRect(x: laneX, y: y - 5, width: laneW, height: 22), width: 1)
     var x = laneX
-    for st in stages.map({ p.stages[$0] }) {
+    for st in stages {
       let wide = laneW * min(st.ms / budget, 1)
-      box(CGRect(x: x, y: y - 5, width: max(wide - 1, 1), height: 22), st.device == "GPU" ? gpu : cpu, radius: 0)
+      box(CGRect(x: x, y: y - 5, width: max(wide - 1, 1), height: 22), st.gpu ? gpu : cpu, radius: 0)
       let short = String(st.name.prefix(wide > 70 ? 7 : 3))
       if wide > 30 { text(short, x + 4, y, black, size: 13, bold: true) }
       x += wide
     }
     y -= row
   }
-  text(p.lanes == nil ? "CPU and GPU share memory: 0 bytes copied"
-                      : "CPU and GPU at the same time, 0 bytes copied", x0, y, dim, size: 14)
+  text(p.alternating != nil ? "the model on GPU and CPU at once, 0 bytes copied"
+       : lanes.count == 1 ? "CPU and GPU share memory: 0 bytes copied"
+       : "CPU and GPU at the same time, 0 bytes copied", x0, y, dim, size: 14)
 }
 
 // MARK: - Window
