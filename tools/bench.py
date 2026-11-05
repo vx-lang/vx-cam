@@ -24,8 +24,8 @@
    command buffer (vx-lang/Vx#2781), segment alone on the GPU and all on the GPU, with a wait
    after each launch (VX_METAL_SYNC=1) and without, taken in turn. An older runtime skips it.
 7. The model on both devices: the model runs on the GPU for even frames and on the CPU for odd
-   ones (VXCAM_ALTERNATE=1), against all on the GPU, taken in turn, and each output hash against
-   all on the CPU.
+   ones (VXCAM_ALTERNATE=1), with each of the 8 placements of the stages after it, against all on
+   the GPU, taken in turn, and each output hash against all on the CPU.
 
 It waits until the load average is below --quiet (3 by default, up to 30 minutes) before each
 part and each round of placements, and records the load before and after each. Other work on the machine shows up in the numbers.
@@ -249,9 +249,12 @@ if 6 in parts:
 if 7 in parts:
     results["load"]["alternate"] = [wait_quiet()]
     reference = parse(run("", env={"VXCAM_HASH": "1"}))["hash"]
-    cases = [("all", "one after another", {}), ("all", "frames overlap", {"VXCAM_OVERLAP": "1"}),
-             ("smooth,blur,composite", "the model alternates", {"VXCAM_ALTERNATE": "1"}),
-             ("composite", "the model alternates", {"VXCAM_ALTERNATE": "1"})]
+    # All on the GPU, one frame after another and overlapping, against the model alternating with
+    # each of the 8 placements of the stages after it.
+    last = STAGES[2:]
+    cases = [("all", "one after another", {}), ("all", "frames overlap", {"VXCAM_OVERLAP": "1"})] + [
+        (",".join(c), "the model alternates", {"VXCAM_ALTERNATE": "1"})
+        for n in range(len(last) + 1) for c in itertools.combinations(last, n)]
     alt = [[] for _ in cases]
     for k in range(args.runs):
         for i, (g, _, e) in enumerate(cases):
@@ -371,18 +374,26 @@ if "waits" in results:
     L.append("")
 
 if "alternate" in results:
+    rows = sorted(results["alternate"], key=lambda r: r["wall"])
+    best, gpu_only = rows[0], next(r for r in rows if r["gpu"] == "all" and r["mode"] == "one after another")
+    def stages(r):
+        return "all" if r["gpu"] == "all" else r["gpu"].replace(",", ", ") or "none"
     L += ["## 7. The model on both devices", "",
           "One thread runs preprocess and segment on the GPU for the even frames, a second runs them on the CPU "
-          "for the odd ones, and a third runs smooth, blur and composite on every frame in order. The devices "
-          "compute the same bits, so the output does not change. Wall time a frame, median of the runs:", "",
+          "for the odd ones, and a third runs smooth, blur and composite on every frame in order, each on its "
+          "own device. The devices compute the same bits, so the output does not change.", "",
+          f"The fastest is **{stages(best)} on the GPU, {best['mode']}**: {best['wall']:.2f} ms a frame "
+          f"({1000 / best['wall']:.0f} frames a second), against {gpu_only['wall']:.2f} ms for all on the GPU one "
+          f"frame after another, so {gpu_only['wall'] / best['wall']:.2f}x as fast. Wall time a frame, median of "
+          "the runs, and how busy each thread is:", "",
           "| Stages on the GPU | Mode | Wall ms | Range | Model on the GPU | Model on the CPU "
-          "| Same output as all CPU |",
-          "| --- | --- | ---: | --- | ---: | ---: | --- |"]
-    for r in results["alternate"]:
-        gpu = "all" if r["gpu"] == "all" else r["gpu"].replace(",", ", ")
+          "| Busy: GPU model, CPU model, last stages | Same output as all CPU |",
+          "| --- | --- | ---: | --- | ---: | ---: | --- | --- |"]
+    for r in rows:
         model = (f"{r['model_gpu']:.2f} | {r['model_cpu']:.2f}" if "model_gpu" in r else "- | -")
-        L.append(f"| {gpu} | {r['mode']} | {r['wall']:.2f} | {r['wall_min']:.2f} to {r['wall_max']:.2f} | {model} "
-                 f"| {'yes' if r['same_output_as_all_cpu'] else 'NO'} |")
+        busy = ", ".join(f"{b:.0f}%" for b in r["busy"]) if "busy" in r else "-"
+        L.append(f"| {stages(r)} | {r['mode']} | {r['wall']:.2f} | {r['wall_min']:.2f} to {r['wall_max']:.2f} | {model} "
+                 f"| {busy} | {'yes' if r['same_output_as_all_cpu'] else 'NO'} |")
     L += ["", "With the model alternating, the GPU and the CPU each run it on every other frame, so preprocess "
               "and segment are in the alternating threads and the stages on the GPU are the rest.", ""]
 
