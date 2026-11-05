@@ -13,9 +13,10 @@
    all of them alike). Each run reports the median of each stage and the wall time a frame.
 3. The CPU and the GPU at the same time: each placement with composite on the GPU, run with
    frames overlapping (VXCAM_OVERLAP=1) and without, and the output hashes of the two compared.
-4. Handoffs and launches: the Vx runtime logs each kernel it launches, with its time on the
-   GPU, and each tensor it had to copy. With each stage alone on the GPU, this counts the
-   launches and copies a frame, and the GPU's busy time against the stage's wall time.
+4. Handoffs and launches: the Vx runtime logs each kernel it launches, each wait for the GPU
+   with the GPU's time, and each tensor it had to copy. With each stage alone on the GPU, this
+   counts the launches, waits and copies a frame, and the GPU's busy time against the stage's
+   wall time.
 5. The model against TFLite and Core ML (with --tflite): its masks against TFLite's
    (tools/check_model.py), and the time of the same model in TFLite and Core ML
    (tools/baseline_model.py). --python is a Python with ai-edge-litert, tflite and coremltools.
@@ -171,12 +172,15 @@ if 4 in parts:
     walls = results.get("placements", {})
     for s in STAGES:
         text = run(s, env={"VX_DISPATCH_VERBOSE": "1"})
+        kernels = len(re.findall(r"\[Vx Metal\] \S+: grid", text))
+        # The GPU's time is on each wait's line. A runtime that waits after each launch (before
+        # vx-lang/Vx#2781) puts it on the launch's line, so there a launch is a wait.
         gpu_ms = [float(x) for x in re.findall(r"\[Vx Metal\] .*?([\d.]+) ms on the GPU", text)]
         copies = len(re.findall(r"\[Vx Metal\] .* is copied", text))
         # The run compares nothing (VXCAM_COMPARE_EVERY=0), so every launch is one of its frames.
         alone = walls.get(name([s]), {}).get("stages", {}).get(s)
-        launches[s] = {"launches_a_frame": len(gpu_ms) / args.frames, "gpu_ms_a_frame": sum(gpu_ms) / args.frames,
-                       "copies": copies, "stage_ms_on_gpu": alone}
+        launches[s] = {"launches_a_frame": kernels / args.frames, "waits_a_frame": len(gpu_ms) / args.frames,
+                       "gpu_ms_a_frame": sum(gpu_ms) / args.frames, "copies": copies, "stage_ms_on_gpu": alone}
     results["launches"] = launches
     results["load"]["launches"].append(load())
     print("part 4: launches", {s: round(v["launches_a_frame"], 1) for s, v in launches.items()})
@@ -256,13 +260,15 @@ if "overlap" in results:
 if "launches" in results:
     L += ["## 4. Handoffs and launches", "",
           "Each stage alone on the GPU, counted from the Vx runtime's own log:", "",
-          "| Stage | Launches a frame | GPU busy a frame | Stage time on the GPU | Tensors copied |",
-          "| --- | ---: | ---: | ---: | ---: |"]
+          "| Stage | Launches a frame | Waits a frame | GPU busy a frame | Stage time on the GPU | Tensors copied |",
+          "| --- | ---: | ---: | ---: | ---: | ---: |"]
     for s, v in results["launches"].items():
         stage = f"{v['stage_ms_on_gpu']:.2f} ms" if v["stage_ms_on_gpu"] else "-"
-        L.append(f"| {s} | {v['launches_a_frame']:.0f} | {v['gpu_ms_a_frame']:.2f} ms | {stage} | {v['copies']} |")
+        waits = v.get("waits_a_frame", v["launches_a_frame"])
+        L.append(f"| {s} | {v['launches_a_frame']:.0f} | {waits:.0f} | {v['gpu_ms_a_frame']:.2f} ms | {stage} "
+                 f"| {v['copies']} |")
     L += ["", "A copy would be logged when Metal cannot use a buffer in place. The difference between the "
-              "stage's time and the GPU's busy time is launching and waiting (vx-lang/Vx#2781).", ""]
+              "stage's time and the GPU's busy time is launching and waiting for the GPU (vx-lang/Vx#2781).", ""]
 
 if "model" in results:
     m = results["model"]
