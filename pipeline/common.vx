@@ -1,0 +1,131 @@
+//===- common.vx - Helpers of the vx-cam pipeline ----------------*- Vx -*-===//
+//
+// The helpers that the stages and the model share. A function says where it
+// runs. The scalar helpers say `on Topology::Any`: they run where they are
+// called, so kernels and host code call the same ones. The samplers read GPU
+// tensors, so they say `on Topology::Device`. vxc inlines a helper into the
+// Metal code. Each also says what memory it touches, so the race checker of
+// `across` loops need not read its body: `writes_only()` for none,
+// `reads_only(t)` for reads of t.
+//
+//===----------------------------------------------------------------------===//
+
+import core::convert;
+
+fn min_i32(a : i32, b : i32) on Topology::Any -> i32
+ensures writes_only()
+{
+  let mut m = b;
+  if a < b {
+    m = a;
+  }
+  return m;
+}
+
+fn max_i32(a : i32, b : i32) on Topology::Any -> i32
+ensures writes_only()
+{
+  let mut m = a;
+  if b > a {
+    m = b;
+  }
+  return m;
+}
+
+fn clamp_i32(v : i32, lo : i32, hi : i32) on Topology::Any -> i32
+ensures writes_only()
+{
+  let mut x = v;
+  if x < lo {
+    x = lo;
+  }
+  if x > hi {
+    x = hi;
+  }
+  return x;
+}
+
+fn max_f32(a : f32, b : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let mut m = b;
+  if a > b {
+    m = a;
+  }
+  return m;
+}
+
+// lo, or v if v is above lo; then hi if that is above hi.
+fn clamp_f32(v : f32, lo : f32, hi : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let mut x = lo;
+  if v > lo {
+    x = v;
+  }
+  if x > hi {
+    x = hi;
+  }
+  return x;
+}
+
+fn abs_f32(v : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let mut a = v;
+  if v < 0.0 {
+    a = 0.0 - v;
+  }
+  return a;
+}
+
+// 0 below `lo`, 1 above `hi`, and a smooth ramp between them.
+fn smoothstep(lo : f32, hi : f32, v : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let t = clamp_f32((v - lo) / (hi - lo), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// Bilinear mix of four neighbours: a and b on the top row, d and e below.
+fn lerp2(a : f32, b : f32, d : f32, e : f32, fx : f32, fy : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  let top = a + fx * (b - a);
+  let bottom = d + fx * (e - d);
+  return top + fy * (bottom - top);
+}
+
+// Bilinear sample of `t`: elements x0 and x1 of rows y0 and y1.
+fn sample_u8(t : &Tensor<u8, [?, ?], Memory::HBM>, y0 : i32, y1 : i32, x0 : i32, x1 : i32,
+fx : f32, fy : f32) on Topology::Device -> f32
+ensures reads_only(t)
+{
+  return lerp2(f32::from(t[y0][x0]), f32::from(t[y0][x1]), f32::from(t[y1][x0]),
+  f32::from(t[y1][x1]), fx, fy);
+}
+
+fn sample_f32(t : &Tensor<f32, [?, ?], Memory::HBM>, y0 : i32, y1 : i32, x0 : i32, x1 : i32,
+fx : f32, fy : f32) on Topology::Device -> f32
+ensures reads_only(t)
+{
+  return lerp2(t[y0][x0], t[y0][x1], t[y1][x0], t[y1][x1], fx, fy);
+}
+
+// 1 on frame 0, where a stage starts its state over, and 0 after it.
+fn first_frame(frame_index : i32) on Topology::Any -> i32
+ensures writes_only()
+{
+  let mut first : i32 = 0;
+  if frame_index == 0 {
+    first = 1;
+  }
+  return first;
+}
+
+// The gray of an RGB pixel, the guide of the filter.
+fn gray(r : f32, g : f32, b : f32) on Topology::Any -> f32
+ensures writes_only()
+{
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}

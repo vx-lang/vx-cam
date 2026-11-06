@@ -1,7 +1,8 @@
 // vxcam.h - The C interface of the Vx pipeline in vxcam.vx.
 //
-// Every stage is a `pub fn` in vxcam.vx, compiled by `vxc -c`, that launches GPU
-// kernels. The host owns every buffer. See vxcam.vx for what each buffer holds.
+// Every stage is a `pub fn` in vxcam.vx, compiled to an object by vxc (see the
+// Makefile), that launches GPU kernels. The host owns every buffer. See vxcam.vx
+// for what each buffer holds.
 #ifndef VXCAM_H
 #define VXCAM_H
 
