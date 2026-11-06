@@ -17,7 +17,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 # folder (*.mov) stay out of git.
 CLIP ?= build/test_clip.mov
 
-.PHONY: all run video camera check bench clean
+.PHONY: all run video camera check bench format clean
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
@@ -31,8 +31,9 @@ build/vxcam.o: pipeline/vxcam.vx $(wildcard pipeline/*.vx) $(VXC) $(DISPATCH) | 
 
 # Info.plist goes into the binary, so macOS can ask for the camera with its reason.
 # build/vx-commit.txt records the Vx commit, for make bench.
-build/vx-cam: shell/main.swift shell/Info.plist pipeline/vxcam.h build/vxcam.o $(DISPATCH)
-	swiftc -O -import-objc-header pipeline/vxcam.h shell/main.swift build/vxcam.o $(LIBS) \
+SHELL_SOURCES = $(wildcard shell/*.swift)
+build/vx-cam: $(SHELL_SOURCES) shell/Info.plist pipeline/vxcam.h build/vxcam.o $(DISPATCH)
+	swiftc -O -import-objc-header pipeline/vxcam.h $(SHELL_SOURCES) build/vxcam.o $(LIBS) \
 	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker shell/Info.plist -o $@
 	git -C $(VX) log -1 --format='%h %cs %s' > build/vx-commit.txt
 
@@ -92,6 +93,13 @@ BENCH_PYTHON ?= python3
 bench: all
 	python3 tools/bench.py --clip build/test_clip.mov $(if $(BENCH_ALSO),--also $(BENCH_ALSO)) \
 	  $(if $(TFLITE),--tflite $(TFLITE) --python $(BENCH_PYTHON))
+
+# Formats the Vx code with vx-format (from the Vx build) and the Swift code with swift-format
+# (from the Swift toolchain), in place. Neither rewrites a file that is already formatted.
+format:
+	$(VX)/target/debug/vx-format pipeline/*.vx
+	xcrun swift-format format -i shell/*.swift tools/*.swift
+	xcrun swift-format lint shell/*.swift tools/*.swift
 
 build:
 	mkdir -p build

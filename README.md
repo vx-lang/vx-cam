@@ -211,6 +211,7 @@ make video CLIP=record-1.mov  # write build/outline.mov (the output with the mas
                               # VIDEO_ALTERNATE=1; see the Makefile)
 make bench    # the measurements above, in build/bench/report.md (about an hour; see
               # tools/bench.py for TFLITE=, BENCH_PYTHON= and BENCH_ALSO=)
+make format   # format the Vx code with vx-format and the Swift code with swift-format
 ```
 
 `--headless N` runs N frames without a window and prints the stage table. These settings
@@ -239,8 +240,14 @@ space pause, `q` quit.
 | Path | What it is |
 | --- | --- |
 | `pipeline/vxcam.vx` | The compute: every stage is a `pub fn`, compiled with `vxc --machine fleet/m4-uma.vx` |
+| `pipeline/model.vx` | The layers of the segmentation model, which `vxcam_model` in vxcam.vx chains |
+| `pipeline/common.vx` | The helpers that the stages and the model share |
 | `pipeline/vxcam.h` | The C interface of those functions, for the shell |
-| `shell/main.swift` | The host shell: video file or camera in, window, overlay, keys. No compute |
+| `shell/main.swift` | The host shell's command line. The shell has no compute |
+| `shell/Pipeline.swift` | The buffers, and the Vx stages called one frame at a time |
+| `shell/Schedules.swift` | Frames on two or three threads (`VXCAM_OVERLAP`, `VXCAM_ALTERNATE`) |
+| `shell/Headless.swift`, `Movie.swift`, `Window.swift` | `--headless`, `--write`, and the window with its overlay and keys |
+| `shell/Sources.swift` | Frames from a movie file or the camera |
 | `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera |
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
 | `models/` | The segmentation model's weights, its license and where it comes from |
