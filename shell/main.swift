@@ -594,10 +594,13 @@ func runAlternating(_ p: Pipeline, _ source: VideoSource, frames: Int,
 /// Environment for a headless run: VXCAM_OVERLAP=1 overlaps frames (runOverlapped);
 /// VXCAM_ALTERNATE=1 runs the model on the GPU and the CPU for alternate frames (runAlternating);
 /// VXCAM_COMPARE_EVERY=K compares the devices every K frames (0: never; unset: the last frame);
-/// VXCAM_HASH=1 prints a hash of every output frame.
+/// VXCAM_HASH=1 prints a hash of every output frame; VXCAM_VIEW=mask or noblur and
+/// VXCAM_OUTLINE=1 pick what the output shows.
 func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   guard let first = source.next() else { fatalError("the clip has no frames") }
   let p = Pipeline(w: CVPixelBufferGetWidth(first), h: CVPixelBufferGetHeight(first))
+  p.mode = ["mask": 1, "noblur": 2][env("VXCAM_VIEW") ?? ""] ?? 0
+  p.outline = env("VXCAM_OUTLINE") == "1"
   let snapshots: Set<Int> = [20, 100, 200, 300, 350]
   let compareEvery = Int(env("VXCAM_COMPARE_EVERY") ?? "") ?? -1
   let hashing = env("VXCAM_HASH") == "1", overlap = env("VXCAM_OVERLAP") == "1"
@@ -629,10 +632,11 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
     if let dir, snapshots.contains(i) {
       writePNG(p.image(), to: "\(dir)/frame\(i).png")
       p.dumpModel("\(dir)/frame\(i)")
+      let mode = p.mode
       p.mode = 1; p.frameIndex -= 1  // the same frame again, as the mask view
       p.process(pb)
       writePNG(p.image(), to: "\(dir)/frame\(i)_mask.png")
-      p.mode = 0
+      p.mode = mode
     }
     if compareEvery > 0 && i % compareEvery == compareEvery - 1 { tally(pb) }
   }

@@ -82,10 +82,7 @@ small : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
           let x = p - y * 256;
           let sy = clamp_f32(((y as f32) + 0.5) * (sh as f32) / 144.0 - 0.5, 0.0, (sh - 1) as f32);
           let sx = clamp_f32(((x as f32) + 0.5) * (sw as f32) / 256.0 - 0.5, 0.0, (sw - 1) as f32);
-          let y0 = sy as i32;
-          let x0 = sx as i32;
-          inp[0][i] = sample_f32(small, y0, min_i32(y0 + 1, sh - 1), x0 * 3 + c,
-          min_i32(x0 + 1, sw - 1) * 3 + c, sx - x0 as f32, sy - y0 as f32);
+          inp[0][i] = bilinear_f32(small, sx, sy, sw, sh, 3, c);
         }
       }
     }

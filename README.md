@@ -220,6 +220,8 @@ change how it runs:
 - `VXCAM_OVERLAP=1`: frames overlap on two threads.
 - `VXCAM_ALTERNATE=1`: the model runs on the GPU and the CPU for alternate frames.
 - `VXCAM_HASH=1`: print a hash of every output frame.
+- `VXCAM_VIEW=mask` or `noblur`, and `VXCAM_OUTLINE=1`: what the output shows (the keys `m`,
+  `b` and `e` in the window).
 - `VXCAM_COMPARE_EVERY=K`: compare the devices every K frames (0 never; by default the last
   frame).
 - `VX_DISPATCH_VERBOSE=1` (Vx): log each GPU launch, each wait, and each tensor copied.

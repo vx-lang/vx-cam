@@ -540,36 +540,43 @@ weights : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, radius : i3
 // pixel is a * I + b, where I is the gray of the sharp frame there.
 //===----------------------------------------------------------------------===//
 
-// The mask at output pixel (ox, oy), as composite_kernel computes it: a * I + b
-// where the pixel comes from.
+// Where output coordinate `o` comes from along one axis of the frame, which is
+// `n` pixels long: the window starts at `origin`, and `k` scales output pixels
+// to frame pixels.
+fn frame_coord(o : i32, origin : f32, k : f32, n : i32) on Topology::Any -> f32
+ensures writes_only()
+{
+  return clamp_f32(origin + ((o as f32) + 0.5) * k - 0.5, 0.0, (n - 1) as f32);
+}
+
+// The same place along that axis of the small images, which are `n` pixels long.
+// `inv_scale` is 1 / scale.
+fn small_coord(s : f32, inv_scale : f32, n : i32) on Topology::Any -> f32
+ensures writes_only()
+{
+  return clamp_f32((s + 0.5) * inv_scale - 0.5, 0.0, (n - 1) as f32);
+}
+
+// The mask at (u, v) in the small images, where the gray of the sharp frame is
+// `i`: a * i + b.
+fn guided_mask(ab : &Tensor<f32, [?, ?], Memory::HBM>, u : f32, v : f32, sw : i32, sh : i32,
+i : f32) on Topology::Device -> f32
+ensures reads_only(ab)
+{
+  let a = bilinear_f32(ab, u, v, sw, sh, 2, 0);
+  let b = bilinear_f32(ab, u, v, sw, sh, 2, 1);
+  return clamp_f32(a * i / 255.0 + b, 0.0, 1.0);
+}
+
+// The mask at (sx, sy) in the frame, which is (u, v) in the small images.
 fn mask_at(frame : &Tensor<u8, [?, ?], Memory::HBM>, ab : &Tensor<f32, [?, ?], Memory::HBM>,
-x0 : f32, y0 : f32, kx : f32, ky : f32, inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32,
-ox : i32, oy : i32) on Topology::Device -> f32
+sx : f32, sy : f32, u : f32, v : f32, w : i32, h : i32, sw : i32, sh : i32) on Topology::Device -> f32
 ensures reads_only(frame)
 ensures reads_only(ab)
 {
-  let sy = clamp_f32(y0 + ((oy as f32) + 0.5) * ky - 0.5, 0.0, (h - 1) as f32);
-  let iy0 = sy as i32;
-  let iy1 = min_i32(iy0 + 1, h - 1);
-  let fy = sy - iy0 as f32;
-  let v = clamp_f32((sy + 0.5) * inv_scale - 0.5, 0.0, (sh - 1) as f32);
-  let vy0 = v as i32;
-  let vy1 = min_i32(vy0 + 1, sh - 1);
-  let gy = v - vy0 as f32;
-  let sx = clamp_f32(x0 + ((ox as f32) + 0.5) * kx - 0.5, 0.0, (w - 1) as f32);
-  let ix0 = sx as i32;
-  let ix1 = min_i32(ix0 + 1, w - 1);
-  let fx = sx - ix0 as f32;
-  let u = clamp_f32((sx + 0.5) * inv_scale - 0.5, 0.0, (sw - 1) as f32);
-  let ux0 = u as i32;
-  let ux1 = min_i32(ux0 + 1, sw - 1);
-  let gx = u - ux0 as f32;
-  let sb = sample_u8(frame, iy0, iy1, ix0 * 4, ix1 * 4, fx, fy);
-  let sg = sample_u8(frame, iy0, iy1, ix0 * 4 + 1, ix1 * 4 + 1, fx, fy);
-  let sr = sample_u8(frame, iy0, iy1, ix0 * 4 + 2, ix1 * 4 + 2, fx, fy);
-  let a = sample_f32(ab, vy0, vy1, ux0 * 2, ux1 * 2, gx, gy);
-  let b = sample_f32(ab, vy0, vy1, ux0 * 2 + 1, ux1 * 2 + 1, gx, gy);
-  return clamp_f32(a * gray(sr, sg, sb) / 255.0 + b, 0.0, 1.0);
+  let i = gray(bilinear_u8(frame, sx, sy, w, h, 4, 2), bilinear_u8(frame, sx, sy, w, h, 4, 1),
+  bilinear_u8(frame, sx, sy, w, h, 4, 0));
+  return guided_mask(ab, u, v, sw, sh, i);
 }
 
 // The window's corner is (x0, y0) in frame pixels, and kx, ky scale output
@@ -582,30 +589,16 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
   spawn on(Topology::Device) {
     for oy in 0..h across blocks {
       for ox in 0..w across lanes(256) {
-        // Where this pixel comes from: sy, sx in the frame, v, u in the small images.
-        let sy = clamp_f32(y0 + ((oy as f32) + 0.5) * ky - 0.5, 0.0, (h - 1) as f32);
-        let iy0 = sy as i32;
-        let iy1 = min_i32(iy0 + 1, h - 1);
-        let fy = sy - iy0 as f32;
-        let v = clamp_f32((sy + 0.5) * inv_scale - 0.5, 0.0, (sh - 1) as f32);
-        let vy0 = v as i32;
-        let vy1 = min_i32(vy0 + 1, sh - 1);
-        let gy = v - vy0 as f32;
-        let sx = clamp_f32(x0 + ((ox as f32) + 0.5) * kx - 0.5, 0.0, (w - 1) as f32);
-        let ix0 = sx as i32;
-        let ix1 = min_i32(ix0 + 1, w - 1);
-        let fx = sx - ix0 as f32;
-        let u = clamp_f32((sx + 0.5) * inv_scale - 0.5, 0.0, (sw - 1) as f32);
-        let ux0 = u as i32;
-        let ux1 = min_i32(ux0 + 1, sw - 1);
-        let gx = u - ux0 as f32;
+        // Where this pixel comes from: (sx, sy) in the frame, (u, v) in the small images.
+        let sx = frame_coord(ox, x0, kx, w);
+        let sy = frame_coord(oy, y0, ky, h);
+        let u = small_coord(sx, inv_scale, sw);
+        let v = small_coord(sy, inv_scale, sh);
         // BGRA in the frame and in `out`, RGB in `blurred`.
-        let sb = sample_u8(frame, iy0, iy1, ix0 * 4, ix1 * 4, fx, fy);
-        let sg = sample_u8(frame, iy0, iy1, ix0 * 4 + 1, ix1 * 4 + 1, fx, fy);
-        let sr = sample_u8(frame, iy0, iy1, ix0 * 4 + 2, ix1 * 4 + 2, fx, fy);
-        let a = sample_f32(ab, vy0, vy1, ux0 * 2, ux1 * 2, gx, gy);
-        let b = sample_f32(ab, vy0, vy1, ux0 * 2 + 1, ux1 * 2 + 1, gx, gy);
-        let m = clamp_f32(a * gray(sr, sg, sb) / 255.0 + b, 0.0, 1.0);
+        let sb = bilinear_u8(frame, sx, sy, w, h, 4, 0);
+        let sg = bilinear_u8(frame, sx, sy, w, h, 4, 1);
+        let sr = bilinear_u8(frame, sx, sy, w, h, 4, 2);
+        let m = guided_mask(ab, u, v, sw, sh, gray(sr, sg, sb));
         // The outline: a pixel whose neighbour one pixel away is on the other side of
         // m = 0.5. The line is two pixels wide.
         let mut view = mode;
@@ -627,7 +620,10 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
             if k == 3 {
               ny = max_i32(oy - 1, 0);
             }
-            let n = mask_at(frame, ab, x0, y0, kx, ky, inv_scale, w, h, sw, sh, nx, ny);
+            let nsx = frame_coord(nx, x0, kx, w);
+            let nsy = frame_coord(ny, y0, ky, h);
+            let n = mask_at(frame, ab, nsx, nsy, small_coord(nsx, inv_scale, sw),
+            small_coord(nsy, inv_scale, sh), w, h, sw, sh);
             if (n >= 0.5) != (m >= 0.5) {
               edge = 1;
             }
@@ -641,8 +637,7 @@ inv_scale : f32, w : i32, h : i32, sw : i32, sh : i32, mode : i32) -> void {
           if c == 2 {
             sharp = sr;
           }
-          let k = 2 - c;
-          let soft = 255.0 * sample_f32(blurred, vy0, vy1, ux0 * 3 + k, ux1 * 3 + k, gx, gy);
+          let soft = 255.0 * bilinear_f32(blurred, u, v, sw, sh, 3, 2 - c);
           let mut value = sharp;
           if view == 0 {
             value = soft + m * (sharp - soft);
