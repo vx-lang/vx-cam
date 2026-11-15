@@ -25,7 +25,7 @@ func hashOutput(_ p: Pipeline, into digest: inout UInt64) {
 /// VXCAM_ALTERNATE=1 runs the model on the GPU and the CPU for alternate frames (runAlternating);
 /// VXCAM_COMPARE_EVERY=K compares the devices every K frames (0: never; unset: the last frame);
 /// VXCAM_HASH=1 prints a hash of every output frame; VXCAM_VIEW=mask or noblur and
-/// VXCAM_OUTLINE=1 pick what the output shows.
+/// VXCAM_OUTLINE=1 pick what the output shows; VXCAM_SCHEDULE moves stages (Scheduler).
 func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   guard let first = source.next() else { fatalError("the clip has no frames") }
   let p = Pipeline(w: CVPixelBufferGetWidth(first), h: CVPixelBufferGetHeight(first))
@@ -101,6 +101,15 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   for i in p.stages.indices { p.stages[i].ms = median(i) }
   p.frameMs = median(p.stages.count)
   if alternate { for k in 0..<2 { p.stages[k].device = "GPU/CPU" } }  // the medians mix the two
+  // Where the stages ended, without a try of the scheduler that the end of the run cut short.
+  let trial = p.scheduler?.stageOnTrial
+  let ended = p.stages.indices.filter { (p.stages[$0].device == "GPU") != ($0 == trial) }
+    .map { p.stages[$0].name }
+  if let s = p.scheduler {  // so do the medians of a stage that moved
+    for i in p.stages.indices where Set(s.placements.map { $0 >> i & 1 }).count == 2 {
+      p.stages[i].device = "GPU/CPU"
+    }
+  }
   print(p.table(fps: source.fps))
   let frame = log.map { $0[p.stages.count] }.sorted()
   print(
@@ -130,6 +139,13 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
           + "the GPU model thread is busy %.0f%% of the time, the CPU one %.0f%%, the last stages %.0f%%",
         mid(model[0]), mid(model[1]), 100 * threads[0] / wall, 100 * threads[1] / wall,
         100 * threads[2] / wall))
+  }
+  if let s = p.scheduler {
+    print(s.summary)
+    print("on the GPU at the end: " + (ended.isEmpty ? "none" : ended.joined(separator: ", ")))
+    if let trial {
+      print("the run ended during a try of \(p.stages[trial].name), which is left out")
+    }
   }
   if hashing { print(String(format: "output hash: %016llx over %d frames", digest, n)) }
   if compareEvery < 0, let last { tally(last) }

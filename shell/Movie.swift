@@ -148,7 +148,7 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   let row = 27.0
   let strip = 440.0
   let top = Double(p.h) - 20
-  let tall = row * (8.6 + Double(lanes.count))
+  let tall = row * (8.6 + Double(lanes.count) + (p.scheduler == nil ? 0 : 2))
   box(
     CGRect(x: x0 - 14, y: top - tall, width: strip + 28, height: tall),
     CGColor(gray: 0, alpha: 0.62), radius: 10)
@@ -168,6 +168,15 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
       continue
     }
     badge(st.device == "GPU", x0 + 124)
+    // A ring around the badge for a second after the scheduler moves the stage.
+    if let s = p.scheduler, let m = s.lastMove, m.stage == i, s.frame - m.frame < 30 {
+      ctx.setStrokeColor(white)
+      ctx.addPath(
+        CGPath(
+          roundedRect: CGRect(x: x0 + 121, y: y - 8, width: 52, height: 28), cornerWidth: 6,
+          cornerHeight: 6, transform: nil))
+      ctx.strokePath()
+    }
     box(
       CGRect(x: x0 + 182, y: y - 3, width: max(2, 180 * min(st.ms / budget, 1)), height: 16),
       st.device == "GPU" ? gpu : cpu, radius: 2)
@@ -203,4 +212,17 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
       : lanes.count == 1
         ? "CPU and GPU share memory: 0 bytes copied"
         : "CPU and GPU at the same time, 0 bytes copied", x0, y, dim, size: 14)
+  // The scheduler: its moves, and what its checks of the two devices found.
+  if let s = p.scheduler {
+    y -= row
+    text(
+      "the app moves stages: \(s.moves) moves, \(s.placements.count) placements", x0, y, white,
+      size: 14)
+    y -= row
+    text(
+      s.checks == 0
+        ? "every frame: the same output on either device"
+        : "\(s.checks) checks: \(s.differ) of \(s.compared.formatted()) values differ", x0, y,
+      s.differ == 0 ? white : CGColor(red: 1, green: 0.3, blue: 0.3, alpha: 1), size: 14)
+  }
 }

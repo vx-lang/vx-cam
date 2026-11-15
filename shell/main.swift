@@ -5,6 +5,7 @@
 //   Sources.swift    frames from a movie file or the camera
 //   Pipeline.swift   the buffers, and the Vx stages called one frame at a time
 //   Schedules.swift  frames on two or three threads (VXCAM_OVERLAP, VXCAM_ALTERNATE)
+//   Scheduler.swift  moves stages between the devices while the app runs (VXCAM_SCHEDULE)
 //   Headless.swift   --headless: stage tables, output hashes, device checks
 //   Movie.swift      --write: a movie of the output, with the stage panel
 //   Window.swift     the window, its overlay and keys

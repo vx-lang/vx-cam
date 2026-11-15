@@ -83,7 +83,8 @@ check: all
 
 # Measures vx-cam and writes build/bench/report.md and results.json (tools/bench.py): the same
 # bits on both devices, every placement, frames overlapping, launches and copies, one GPU wait a
-# function, and the model alternating between the devices. BENCH_ALSO adds
+# function, the model alternating between the devices, and stages that move while the app runs.
+# BENCH_ALSO adds
 # a second clip, such as a recording. With TFLITE (the original .tflite, see models/README.md)
 # and BENCH_PYTHON (a Python with ai-edge-litert, tflite and coremltools), it also checks the
 # model against TFLite and times it in TFLite and Core ML. About an hour, on a quiet machine.

@@ -41,6 +41,70 @@ struct Diff {
   }
 }
 
+/// A copy of a buffer, to put the buffer back as it was.
+final class Saved<T> {
+  private let buf: Shared<T>
+  private let copy: UnsafeMutablePointer<T>
+  init(_ buf: Shared<T>) {
+    self.buf = buf
+    copy = .allocate(capacity: buf.count)
+    copy.update(from: buf.ptr, count: buf.count)
+  }
+  deinit { copy.deallocate() }
+  func restore() { buf.ptr.update(from: copy, count: buf.count) }
+}
+
+/// A buffer that a stage writes, in a check of the two devices (Pipeline.checkStage).
+protocol Checked: AnyObject {
+  /// The number of GPU runs that this buffer needs: one for each of its fills.
+  var rounds: Int { get }
+  /// Keeps the buffer as the CPU run left it.
+  func keepCPU()
+  /// Fills the buffer before GPU run `round`, so an element that the GPU skips cannot match.
+  func fill(_ round: Int)
+  /// Counts the elements that differ from the CPU's.
+  func compare()
+  var diff: Diff { get }
+}
+
+/// A buffer of `T` in a check. A nil fill leaves the buffer as the stage's reset left it, for a
+/// buffer that the stage reads as well as writes.
+final class Output<T: Measured>: Checked {
+  private let name: String
+  private let buf: Shared<T>
+  private let fills: [Int32?]
+  private let cpu: UnsafeMutablePointer<T>
+  private var differ = 0, total = 0, worst = 0.0
+  init(_ name: String, _ buf: Shared<T>, fills: [Int32?]) {
+    (self.name, self.buf, self.fills) = (name, buf, fills)
+    cpu = .allocate(capacity: buf.count)
+  }
+  deinit { cpu.deallocate() }
+  var rounds: Int { fills.count }
+  func keepCPU() { cpu.update(from: buf.ptr, count: buf.count) }
+  func fill(_ round: Int) {
+    if round < fills.count, let f = fills[round] { memset(buf.ptr, f, buf.bytes) }
+  }
+  func compare() {
+    let size = MemoryLayout<T>.size
+    for i in 0..<buf.count where memcmp(cpu + i, buf.ptr + i, size) != 0 {
+      differ += 1
+      worst = max(worst, abs(cpu[i].value - buf.ptr[i].value))
+    }
+    total += buf.count
+  }
+  var diff: Diff { Diff(name: name, differ: differ, total: total, worst: worst) }
+}
+
+/// One stage run on both devices over the same input: the time on each, and what differs.
+struct Check {
+  let stage: Int
+  let cpuMs: Double, gpuMs: Double
+  let diffs: [Diff]
+  var differ: Int { diffs.reduce(0) { $0 + $1.differ } }
+  var total: Int { diffs.reduce(0) { $0 + $1.total } }
+}
+
 /// One stage as the overlay shows it.
 struct StageInfo {
   let name: String
@@ -123,6 +187,7 @@ final class Pipeline {
     for i in stages.indices where gpu == "all" || names.contains(stages[i].name) {
       stages[i].device = "GPU"
     }
+    scheduler = Scheduler.fromEnvironment(stages: stages.map(\.name))
   }
 
   /// Moves a stage between the CPU and the GPU.
@@ -202,33 +267,30 @@ final class Pipeline {
     return Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
   }
 
-  /// Runs `run` on the CPU, then on the GPU over each fill of `buf`, and compares the
-  /// bits. A GPU run that skips an element cannot match, because no element equals
-  /// every fill: NaN for floats, 0x00 and then 0xFF for bytes. A nil fill leaves `buf`
-  /// as `reset` left it, for a buffer that the stage reads as well as writes. `reset`
-  /// runs before each run, to put back the state that a stage keeps between frames.
-  private func compare<T: Measured>(
-    _ name: String, _ buf: Shared<T>, fills: [Int32?], reset: () -> Void = {},
-    _ run: (Bool) -> Void
-  ) -> Diff {
-    reset()
-    run(false)
-    let cpu = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
-    defer { cpu.deallocate() }
-    cpu.update(from: buf.ptr, count: buf.count)
-    let size = MemoryLayout<T>.size
-    var differ = 0
-    var worst = 0.0
-    for fill in fills {
-      reset()
-      if let fill { memset(buf.ptr, fill, buf.bytes) }
-      run(true)
-      for i in 0..<buf.count where memcmp(cpu + i, buf.ptr + i, size) != 0 {
-        differ += 1
-        worst = max(worst, abs(cpu[i].value - buf.ptr[i].value))
-      }
+  /// Runs `run` on the CPU, then on the GPU once for each fill of `outputs`, and compares the
+  /// bits of each output. A GPU run that skips an element cannot match, because no element
+  /// equals every fill: NaN for floats, 0x00 and then 0xFF for bytes. `reset` runs before each
+  /// run, to put back the state that a stage keeps between frames. The GPU's time is its fastest
+  /// run.
+  private func check(
+    _ stage: Int, _ outputs: [any Checked], reset: () -> Void = {}, _ run: (Bool) -> Void
+  ) -> Check {
+    func timed(_ body: () -> Void) -> Double {
+      let t0 = DispatchTime.now().uptimeNanoseconds
+      body()
+      return Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
     }
-    return Diff(name: name, differ: differ, total: buf.count * fills.count, worst: worst)
+    reset()
+    let cpuMs = timed { run(false) }
+    for o in outputs { o.keepCPU() }
+    var gpuMs = Double.infinity
+    for round in 0..<(outputs.map(\.rounds).max() ?? 1) {
+      reset()
+      for o in outputs { o.fill(round) }
+      gpuMs = min(gpuMs, timed { run(true) })
+      for o in outputs { o.compare() }
+    }
+    return Check(stage: stage, cpuMs: cpuMs, gpuMs: gpuMs, diffs: outputs.map(\.diff))
   }
 
   /// Writes the model's input and mask, for tools/check_model.py.
@@ -242,16 +304,11 @@ final class Pipeline {
     }
   }
 
-  /// A function that puts `buf` back as it is now.
-  private func snapshot<T>(_ buf: Shared<T>) -> () -> Void {
-    let saved = UnsafeMutablePointer<T>.allocate(capacity: buf.count)
-    saved.update(from: buf.ptr, count: buf.count)
-    return { buf.ptr.update(from: saved, count: buf.count) }  // kept for the check only
-  }
-
-  /// Runs each stage on both devices over `pb`, in pipeline order, and compares. It uses
-  /// slot 0, as a frame run one stage after another does.
-  func compareStages(_ pb: CVPixelBuffer) -> [Diff] {
+  /// Runs stage `i` on both devices over frame `pb`, in slot 0, and compares what each wrote.
+  /// The state that the stage keeps goes back before each run, so the frame goes on as if the
+  /// stage ran once. The buffers end as the GPU wrote them. `outline: true` checks composite
+  /// with the mask's outline drawn.
+  func checkStage(_ i: Int, _ pb: CVPixelBuffer, outline: Bool? = nil) -> Check {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     let frame = UnsafePointer(CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self))
@@ -260,49 +317,53 @@ final class Pipeline {
       crops[0].ptr.update(from: crops[cropSlot].ptr, count: 4)
       cropSlot = 0
     }
-    let (small, mask, blurred, ab, crop) = (smalls[0], masks[0], blurreds[0], abSlots[0], crops[0])
-    // segment and smooth update state in place, so each run starts from a copy of it.
-    let restoreBackground = snapshot(background)
-    let restoreHistory = snapshot(history)
-    let restoreCrop = snapshot(crop)
-    let restoreSmooth = {
-      restoreHistory()
-      restoreCrop()
-    }
-    return [
-      compare("preprocess", small, fills: [-1]) {
+    switch i {
+    case 0:
+      return check(0, [Output("preprocess", smalls[0], fills: [-1])]) {
         runPreprocess(frame, stride, onGPU: $0)
-      },
-      compare("segment mask", mask, fills: [-1], reset: restoreBackground) {
-        runSegment(onGPU: $0)
-      },
-      compare(
-        "segment background", background, fills: [nil], reset: restoreBackground
-      ) { runSegment(onGPU: $0) },
-      compare("smooth rows", maskScratch, fills: [-1], reset: restoreSmooth) {
-        runSmooth(onGPU: $0)
-      },
-      compare("smooth history", history, fills: [nil], reset: restoreSmooth) {
-        runSmooth(onGPU: $0)
-      },
-      // No row statistic is 0x7F7F7F7F, so a skipped one cannot match.
-      compare("smooth stats", stats, fills: [0x7F], reset: restoreSmooth) {
-        runSmooth(onGPU: $0)
-      },
-      compare("smooth crop", crop, fills: [nil], reset: restoreSmooth) {
-        runSmooth(onGPU: $0)
-      },
-      compare("smooth guide", ab, fills: [-1], reset: restoreSmooth) {
-        runSmooth(onGPU: $0)
-      },
-      compare("blur", blurred, fills: [-1]) { runBlur(onGPU: $0) },
-      compare("composite", out, fills: [0x00, 0xFF]) {
-        runComposite(frame, stride, onGPU: $0)
-      },
-      compare("composite outline", out, fills: [0x00, 0xFF]) {
-        runComposite(frame, stride, onGPU: $0, outline: true)
-      },
-    ]
+      }
+    case 1:
+      // A nil fill leaves a buffer as the reset left it, for one that the stage also reads.
+      let saved = Saved(background)
+      return check(
+        1,
+        [
+          Output("segment mask", masks[0], fills: [-1]),
+          Output("segment background", background, fills: [nil]),
+        ], reset: saved.restore
+      ) { runSegment(onGPU: $0) }
+    case 2:
+      let (history, crop) = (Saved(self.history), Saved(crops[0]))
+      let reset = {
+        history.restore()
+        crop.restore()
+      }
+      return check(
+        2,
+        [
+          Output("smooth rows", maskScratch, fills: [-1]),
+          Output("smooth history", self.history, fills: [nil]),
+          // No row statistic is 0x7F7F7F7F, so a skipped one cannot match.
+          Output("smooth stats", stats, fills: [0x7F]),
+          Output("smooth crop", crops[0], fills: [nil]),
+          Output("smooth guide", abSlots[0], fills: [-1]),
+        ],
+        reset: reset
+      ) { runSmooth(onGPU: $0) }
+    case 3:
+      return check(3, [Output("blur", blurreds[0], fills: [-1])]) { runBlur(onGPU: $0) }
+    default:
+      let name = outline == true ? "composite outline" : "composite"
+      return check(4, [Output(name, out, fills: [0x00, 0xFF])]) {
+        runComposite(frame, stride, onGPU: $0, outline: outline)
+      }
+    }
+  }
+
+  /// Runs each stage on both devices over `pb`, in pipeline order, and compares. It uses
+  /// slot 0, as a frame run one stage after another does.
+  func compareStages(_ pb: CVPixelBuffer) -> [Diff] {
+    stages.indices.flatMap { checkStage($0, pb).diffs } + checkStage(4, pb, outline: true).diffs
   }
 
   /// Records one frame's stage times, and its whole time, in the moving averages. While the
@@ -330,11 +391,32 @@ final class Pipeline {
   /// (first) and on the CPU, for the panel.
   var alternating: [[Double]]?
 
-  /// Runs the five stages on `pb` one after another, in slot 0.
+  /// Moves stages between the devices while frames run one after another (VXCAM_SCHEDULE).
+  var scheduler: Scheduler?
+
+  /// Runs the five stages on `pb` one after another, in slot 0. The scheduler may move a stage
+  /// before the frame, or run one stage on both devices in it and compare them.
   func process(_ pb: CVPixelBuffer) {
     let start = DispatchTime.now().uptimeNanoseconds
-    let times = stages.indices.map { runStage($0, pb, onGPU: stages[$0].device == "GPU", slot: 0) }
-    record(times, frame: Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+    let plan = scheduler?.plan() ?? (move: nil, check: nil)
+    if let i = plan.move {
+      _ = toggle(stage: i)
+      scheduler!.moved(i, toGPU: stages[i].device == "GPU")
+    }
+    var times = [Double](repeating: 0, count: stages.count)
+    var check: Check?
+    for i in stages.indices {
+      let onGPU = stages[i].device == "GPU"
+      if i == plan.check {
+        check = checkStage(i, pb)
+        times[i] = onGPU ? check!.gpuMs : check!.cpuMs
+      } else {
+        times[i] = runStage(i, pb, onGPU: onGPU, slot: 0)
+      }
+    }
+    let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+    record(times, frame: ms)
+    scheduler?.finished(frame: ms, onGPU: stages.map { $0.device == "GPU" }, check: check)
     frameIndex += 1
   }
 
@@ -366,6 +448,11 @@ final class Pipeline {
     let modes = ["blur", "mask", "no blur"]
     s +=
       "view: \(modes[mode])\(outline ? " + outline" : "")   framing: \(autoFraming ? "auto" : "off")"
+    if let scheduler {
+      s += "\n" + scheduler.status + (scheduler.event.isEmpty ? "" : "\n" + scheduler.event)
+    } else {
+      s += "\nscheduler: off (a turns it on)"
+    }
     return note.isEmpty ? s : s + "\n" + note
   }
 }
