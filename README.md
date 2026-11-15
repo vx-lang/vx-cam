@@ -199,7 +199,9 @@ Neural Engine. Vx runs it on the CPU and on the GPU. Both get the same input, th
 model makes from the frame. Each side shows the mask, and what the move changed. That is the
 mask on the new device against the mask on the device before, for the same frame:
 
-![Core ML's move from the CPU to the GPU changes 35,836 of 36,864 values of the mask. Vx's move changes none.](docs/compare.png)
+[![Core ML's move from the CPU to the GPU changes 35,836 of 36,864 values of the mask. Vx's move changes none.](docs/compare.png)](artifacts/compare.mov)
+
+The picture is one frame of the movie of the test clip, [`artifacts/compare.mov`](artifacts/compare.mov).
 
 The values of the mask that differ between two devices, over every frame of each clip (36,864
 values a frame), with the largest difference:
