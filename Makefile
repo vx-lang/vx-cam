@@ -17,7 +17,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 # folder (*.mov) stay out of git.
 CLIP ?= build/test_clip.mov
 
-.PHONY: all run video camera check bench format clean
+.PHONY: all run video compare camera check bench format clean
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
@@ -66,6 +66,20 @@ VIDEO_ENV = VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) VXCAM_ALTERNAT
 video: all
 	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
 	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
+
+# The model in Core ML, for make compare (tools/coreml_model.py). It needs TFLITE, the original
+# .tflite file (models/README.md), and BENCH_PYTHON, a Python with tflite and coremltools.
+build/selfie_fp32.mlpackage build/selfie_fp16.mlpackage: | build
+	@test -n "$(TFLITE)" || { echo "$@ needs TFLITE=<the .tflite file>, see models/README.md"; exit 1; }
+	$(BENCH_PYTHON) tools/coreml_model.py $(TFLITE) $@ $(if $(findstring fp16,$@),--fp16)
+
+# Writes build/compare.mov: the segmentation model moves to the next device every second, in Core
+# ML (CPU only, CPU and GPU, CPU and Neural Engine) and in Vx (the CPU, the GPU), on the same
+# input. Each side shows the mask and what the move changed. It prints, for each pair of devices,
+# the values of the mask that differ. COMPARE_FRAMES sets the length (the clip once by default).
+COMPARE_FRAMES ?=
+compare: all build/selfie_fp32.mlpackage build/selfie_fp16.mlpackage
+	./build/vx-cam $(CLIP) --compare build/compare.mov $(COMPARE_FRAMES)
 
 # The default camera. macOS asks once for permission. With VXCAM_SEGMENT=standin, step out
 # of view and press r, so the stand-in learns the empty room, then step back in.

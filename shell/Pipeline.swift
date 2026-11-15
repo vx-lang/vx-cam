@@ -293,6 +293,20 @@ final class Pipeline {
     return Check(stage: stage, cpuMs: cpuMs, gpuMs: gpuMs, diffs: outputs.map(\.diff))
   }
 
+  /// Runs preprocess on the CPU and the model on `pb`, with the model on the GPU when `onGPU`.
+  /// Returns the model's input (144 x 256 x 3 floats) and its mask (144 x 256), which stay as
+  /// they are until the next run.
+  func runModel(_ pb: CVPixelBuffer, onGPU: Bool) -> (
+    input: UnsafePointer<Float>, mask: UnsafePointer<Float>
+  ) {
+    guard let a = model?.arenas[0].ptr else {
+      fatalError("the stand-in has no model (VXCAM_SEGMENT)")
+    }
+    _ = runStage(0, pb, onGPU: false, slot: 0)
+    _ = runStage(1, pb, onGPU: onGPU, slot: 0)
+    return (UnsafePointer(vxcam_model_input(a)!), UnsafePointer(vxcam_model_mask(a)!))
+  }
+
   /// Writes the model's input and mask, for tools/check_model.py.
   func dumpModel(_ prefix: String) {
     guard let a = model?.arenas[0].ptr else { return }

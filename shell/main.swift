@@ -8,6 +8,7 @@
 //   Scheduler.swift  moves stages between the devices while the app runs (VXCAM_SCHEDULE)
 //   Headless.swift   --headless: stage tables, output hashes, device checks
 //   Movie.swift      --write: a movie of the output, with the stage panel
+//   Compare.swift    --compare: a movie of the model moving between devices, in Core ML and Vx
 //   Window.swift     the window, its overlay and keys
 //
 // Usage:
@@ -18,12 +19,16 @@
 //   vx-cam <clip.mov> --write out.mov [mask] [outline] [panel]
 //                                          run every frame once and write the output to out.mov:
 //                                          the mask view, the mask's outline, the stage panel
+//   vx-cam <clip.mov> --compare out.mov [N]
+//                                          write a movie of the model moving between devices
+//                                          each second, in Core ML and in Vx, over N frames
+//                                          (the clip once by default)
 import AppKit
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
   print(
-    "usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel]]  |  vx-cam --camera"
+    "usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel] | --compare out.mov [N]]  |  vx-cam --camera"
   )
   exit(2)
 }
@@ -38,6 +43,10 @@ if args[1] == "--camera" {
   }
   if args.count >= 4 && args[2] == "--write" {
     runWrite(source: clip, to: args[3], options: Set(args.dropFirst(4)))
+    exit(0)
+  }
+  if args.count >= 4 && args[2] == "--compare" {
+    runCompare(source: clip, to: args[3], frames: args.count >= 5 ? Int(args[4]) : nil)
     exit(0)
   }
   source = clip
