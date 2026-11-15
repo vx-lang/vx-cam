@@ -266,8 +266,10 @@ make video CLIP=record-1.mov  # write build/outline.mov (the output with the mas
                               # each stage runs and how long it takes; by default the model
                               # alternates between the GPU and the CPU (VIDEO_GPU=,
                               # VIDEO_ALTERNATE=1; see the Makefile)
-make compare  # write build/compare.mov: the model moves between devices every second, in
-              # Core ML and in Vx (the Makefile says how to build the Core ML packages)
+make compare TFLITE=selfie_segmentation_landscape.tflite
+              # write build/compare.mov: the model moves between devices every second, in
+              # Core ML and in Vx. The first run builds the Core ML packages from the .tflite
+              # file. Give BENCH_PYTHON= a Python with tflite and coremltools.
 make bench    # the measurements above, in build/bench/report.md (about an hour; see
               # tools/bench.py for TFLITE=, BENCH_PYTHON= and BENCH_ALSO=)
 make format   # format the Vx code with vx-format and the Swift code with swift-format
