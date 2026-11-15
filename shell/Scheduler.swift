@@ -11,7 +11,8 @@ import Foundation
 ///   back. A stage that it moved back waits for more turns before its next try. Between tries,
 ///   it runs one stage on both devices over the same input, and compares their outputs.
 /// - `every:N` moves one stage to the other device every N frames. The moves follow a Gray
-///   code, so 32 moves visit all 32 placements of the five stages.
+///   code, so 32 moves visit all 32 placements of the five stages. Halfway between two moves,
+///   it checks one stage on both devices, as `auto` does.
 ///
 /// One frame on the other device does not tell the time there: a GPU that was idle runs at a
 /// low clock, and segment took 16.5 ms in such a frame against 5.1 ms on a busy GPU.
@@ -99,6 +100,8 @@ final class Scheduler {
       case .every(let n) where frame > 0 && frame % n == 0:
         let k = frame / n % (1 << names.count)
         pending = (k == 0 ? names.count - 1 : k.trailingZeroBitCount, .forced)
+      case .every(let n) where n >= 2 && frame % n == n / 2:
+        plan.check = nextStageToCheck()
       case .auto where pending == nil && trial == nil:
         if since >= period && since % period == 0 && recent.count >= window,
           let i = nextStageToTry()
@@ -107,14 +110,19 @@ final class Scheduler {
           trial = (i, before)
           pending = (i, .trying)
         } else if since % period == period / 2 {
-          plan.check = nextCheck
-          nextCheck = (nextCheck + 1) % names.count
+          plan.check = nextStageToCheck()
         }
       default: break
       }
       if let p = pending { plan.move = p.stage }
     }
     return plan
+  }
+
+  /// The next stage to run on both devices, in turn.
+  private func nextStageToCheck() -> Int {
+    defer { nextCheck = (nextCheck + 1) % names.count }
+    return nextCheck
   }
 
   /// The next stage to try on the other device, in turn, passing over the stages that wait.

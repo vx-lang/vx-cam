@@ -163,7 +163,8 @@ can move any stage between two frames, and the output does not change. `VXCAM_SC
 stages while frames run one after another ([`shell/Scheduler.swift`](shell/Scheduler.swift)):
 
 - `every:10` moves one stage every 10 frames, in the order of a Gray code. In the 360 frames of
-  a run, it makes 35 moves and runs all 32 placements.
+  a run, it makes 35 moves and runs all 32 placements. Halfway between two moves, it checks one
+  stage on both devices, as `auto` does.
 - `auto`, or the key `a` in the window, looks for a faster placement. Every 30 frames it moves
   one stage to the other device. After 5 frames, it takes the median frame time over 15 frames.
   It keeps the move when the frame got more than 5% faster, and else it moves the stage back.
@@ -175,15 +176,16 @@ that was idle runs at a low clock. In one frame on such a GPU, segment took 16.5
 7.4 ms on the CPU and 5.1 ms on a GPU that was busy every frame.
 
 `make bench` part 8, with Vx 24c48ad8 on 2026-11-14, with other work on the machine (load
-average 4.5 to 5). Same output means that the hash of every output frame matches the run with
-every stage on the CPU:
+average 4.5 to 5). The `every:10` rows are from 2026-11-15, after `every:N` started to check
+stages. Same output means that the hash of every output frame matches the run with every stage
+on the CPU:
 
 | Clip | Start | Rule | Moves | Placements | Values that the checks compared | Values that differ | Same output |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
-| test clip | all on the CPU | `every:10` | 35 | 32 | 0 | 0 | yes |
+| test clip | all on the CPU | `every:10` | 35 | 32 | 57,431,008 | 0 | yes |
 | test clip | all on the CPU | `auto` | 13 | 10 | 8,179,744 | 0 | yes |
 | test clip | all on the GPU | `auto` | 13 | 8 | 8,352,544 | 0 | yes |
-| camera recording | all on the CPU | `every:10` | 35 | 32 | 0 | 0 | yes |
+| camera recording | all on the CPU | `every:10` | 35 | 32 | 57,431,008 | 0 | yes |
 | camera recording | all on the CPU | `auto` | 13 | 9 | 8,352,544 | 0 | yes |
 | camera recording | all on the GPU | `auto` | 12 | 6 | 8,813,888 | 0 | yes |
 
@@ -270,6 +272,8 @@ make video CLIP=record-1.mov  # write build/outline.mov (the output with the mas
                               # each stage runs and how long it takes; by default the model
                               # alternates between the GPU and the CPU (VIDEO_GPU=,
                               # VIDEO_ALTERNATE=1; see the Makefile)
+make demo     # write build/demo.mov: 60 seconds of the output with the panel. Every 56 frames
+              # the app moves one stage, and it visits all 32 placements. The clip loops.
 make compare TFLITE=selfie_segmentation_landscape.tflite
               # write build/compare.mov: the model moves between devices every second, in
               # Core ML and in Vx. The first run builds the Core ML packages from the .tflite
@@ -286,9 +290,10 @@ change how it runs:
 - `VXCAM_OVERLAP=1`: frames overlap on two threads.
 - `VXCAM_ALTERNATE=1`: the model runs on the GPU and the CPU for alternate frames.
 - `VXCAM_SCHEDULE=auto`: the app moves stages to the faster device while it runs (the key `a`
-  in the window). `VXCAM_SCHEDULE=every:N` moves one stage every N frames.
-  `VXCAM_SCHEDULE_LOG=1` prints each move and each check.
+  in the window). `VXCAM_SCHEDULE=every:N` moves one stage every N frames, and checks one stage
+  on both devices halfway between moves. `VXCAM_SCHEDULE_LOG=1` prints each move and each check.
 - `VXCAM_HASH=1`: print a hash of every output frame.
+- `VXCAM_BITRATE=B`: the bits a second of a movie from `--write` or `--compare`.
 - `VXCAM_VIEW=mask` or `noblur`, and `VXCAM_OUTLINE=1`: what the output shows (the keys `m`,
   `b` and `e` in the window).
 - `VXCAM_COMPARE_EVERY=K`: compare the devices every K frames (0 never; by default the last

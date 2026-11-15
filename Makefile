@@ -17,7 +17,7 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 # folder (*.mov) stay out of git.
 CLIP ?= build/test_clip.mov
 
-.PHONY: all run video compare camera check bench format clean
+.PHONY: all run video demo compare camera check bench format clean
 
 all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
 
@@ -66,6 +66,14 @@ VIDEO_ENV = VXCAM_GPU=$(VIDEO_GPU) VXCAM_OVERLAP=$(VIDEO_OVERLAP) VXCAM_ALTERNAT
 video: all
 	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/outline.mov outline panel
 	$(VIDEO_ENV) ./build/vx-cam $(CLIP) --write build/mask.mov mask outline panel
+
+# Writes build/demo.mov, 60 seconds of the output with the panel, and loops the clip. Every 56
+# frames the app moves one stage to the other device. 32 moves visit all 32 placements. Halfway
+# between moves, the app runs one stage on both devices and counts the values that differ. The
+# bitrate keeps the movie under 10 MB, the largest movie that GitHub takes on a free plan.
+demo: all
+	VXCAM_SCHEDULE=every:56 VXCAM_BITRATE=1100000 \
+	  ./build/vx-cam $(CLIP) --write build/demo.mov outline panel 1800
 
 # The model in Core ML, for make compare (tools/coreml_model.py). It needs TFLITE, the original
 # .tflite file (models/README.md), and BENCH_PYTHON, a Python with tflite and coremltools.

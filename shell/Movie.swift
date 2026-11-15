@@ -2,7 +2,7 @@
 import AVFoundation
 import AppKit
 
-/// An H.264 movie of BGRA frames.
+/// An H.264 movie of BGRA frames, at VXCAM_BITRATE bits a second (8,000,000 by default).
 final class MovieWriter {
   private let path: String
   private let writer: AVAssetWriter
@@ -17,11 +17,13 @@ final class MovieWriter {
     guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else {
       fatalError("cannot write \(path)")
     }
+    let rate = env("VXCAM_BITRATE").map { Int($0) ?? 0 } ?? 8_000_000
+    precondition(rate > 0, "VXCAM_BITRATE must be a number of bits a second above 0")
     input = AVAssetWriterInput(
       mediaType: .video,
       outputSettings: [
         AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
-        AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000],
+        AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: rate],
       ])
     adaptor = AVAssetWriterInputPixelBufferAdaptor(
       assetWriterInput: input,
@@ -85,18 +87,26 @@ func bitmapContext(_ pb: CVPixelBuffer) -> CGContext? {
       | CGBitmapInfo.byteOrder32Little.rawValue)
 }
 
-/// Runs every frame of the clip once and writes the output frames to a movie, at their times.
-/// `options` may hold "mask" (the mask view), "outline" and "panel" (drawPanel). VXCAM_OVERLAP=1
-/// and VXCAM_ALTERNATE=1 run the frames as in runHeadless.
-func runWrite(source: VideoSource, to path: String, options: Set<String>) {
-  source.loops = false
+/// Runs the clip and writes the output frames to a movie. `options` may hold "mask" (the mask
+/// view), "outline" and "panel" (drawPanel). Without `frames`, it runs every frame of the clip
+/// once, at the clip's times. With `frames`, it runs that many frames and plays the clip again
+/// from the start when it ends. VXCAM_OVERLAP=1 and VXCAM_ALTERNATE=1 run the frames as in
+/// runHeadless.
+func runWrite(source: VideoSource, to path: String, options: Set<String>, frames: Int? = nil) {
+  source.loops = frames != nil
   guard let first = source.next() else { fatalError("the clip has no frames") }
   let (w, h) = (CVPixelBufferGetWidth(first), CVPixelBufferGetHeight(first))
   let p = Pipeline(w: w, h: h)
   p.mode = options.contains("mask") ? 1 : 0
   p.outline = options.contains("outline")
-  let movie = MovieWriter(path: path, w: w, h: h, start: source.time)
-  func emit(_ time: CMTime) {
+  let total = frames ?? Int.max
+  precondition(total > 0, "--write needs a number of frames above 0")
+  let movie = MovieWriter(path: path, w: w, h: h, start: frames == nil ? source.time : .zero)
+  // The clip's times start again when it loops, so a frame count gives frame k the time k / fps.
+  func emit(_ clipTime: CMTime) {
+    let time =
+      frames == nil
+      ? clipTime : CMTime(seconds: Double(movie.frames) / source.fps, preferredTimescale: 600)
     movie.append(at: time) { frame in
       CVPixelBufferLockBaseAddress(frame, [])
       let dst = CVPixelBufferGetBaseAddress(frame)!
@@ -112,7 +122,7 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
   var lastDone = nowMs()
   var k = 0
   if env("VXCAM_ALTERNATE") == "1" {
-    _ = runAlternating(p, source, frames: Int.max) { times, _, time in
+    _ = runAlternating(p, source, frames: total - 1) { times, _, time in
       let done = nowMs()
       p.record(times, frame: done - lastDone, modelOnGPU: k % 2 == 0)  // frames come out in order
       lastDone = done
@@ -120,14 +130,14 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
       emit(time)
     }
   } else if env("VXCAM_OVERLAP") == "1" {
-    _ = runOverlapped(p, source, frames: Int.max) { times, _, time in
+    _ = runOverlapped(p, source, frames: total - 1) { times, _, time in
       let done = nowMs()
       p.record(times, frame: done - lastDone)
       lastDone = done
       emit(time)
     }
   } else {
-    while let pb = source.next() {
+    while movie.frames < total, let pb = source.next() {
       p.process(pb)
       emit(source.time)
     }
@@ -256,7 +266,8 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
     text(
       s.checks == 0
         ? "every frame: the same output on either device"
-        : "\(s.checks) checks: \(s.differ) of \(s.compared.formatted()) values differ", x0, y,
+        : "\(s.checks) checks: \(s.differ.formatted()) of \(s.compared.formatted()) values differ",
+      x0, y,
       s.differ == 0 ? white : CGColor(red: 1, green: 0.3, blue: 0.3, alpha: 1), size: 14)
   }
 }
