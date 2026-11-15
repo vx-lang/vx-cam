@@ -38,6 +38,8 @@ func runOverlapped(
   _ p: Pipeline, _ source: VideoSource, frames: Int,
   after: @escaping ([Double], CVPixelBuffer, CMTime) -> Void
 ) -> (wall: Double, front: Double, back: Double) {
+  precondition(
+    p.scheduler == nil, "VXCAM_SCHEDULE needs frames one after another, not VXCAM_OVERLAP")
   let onGPU = p.stages.map { $0.device == "GPU" }
   let back = onGPU[3] == onGPU[4] ? [3, 4] : [4]
   let front = p.stages.indices.filter { !back.contains($0) }
@@ -102,6 +104,8 @@ func runAlternating(
 ) -> (wall: Double, busy: [Double]) {
   precondition(
     p.hasModel, "the model alternates between the devices, so the stand-in cannot (VXCAM_SEGMENT)")
+  precondition(
+    p.scheduler == nil, "VXCAM_SCHEDULE needs frames one after another, not VXCAM_ALTERNATE")
   p.alternating = [[0, 0], [0, 0]]
   let n = Pipeline.slots
   final class Hand {

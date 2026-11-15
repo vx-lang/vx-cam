@@ -36,13 +36,13 @@ final class App: NSObject, NSApplicationDelegate {
     overlay.foregroundColor = NSColor.white.cgColor
     overlay.backgroundColor = NSColor(white: 0, alpha: 0.6).cgColor
     overlay.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
-    overlay.frame = CGRect(x: 10, y: 10, width: 400, height: 150)
+    overlay.frame = CGRect(x: 10, y: 10, width: 560, height: 190)
     view.layer!.addSublayer(video)
     view.layer!.addSublayer(overlay)
     view.onKey = { [weak self] k in self?.key(k) }
     window.contentView = view
     window.title =
-      "vx-cam  ·  keys: m mask  e outline  b blur  f framing  1-5 device  r relearn  o overlay  space pause  q quit"
+      "vx-cam  ·  keys: m mask  e outline  b blur  f framing  1-5 device  a scheduler  r relearn  o overlay  space pause  q quit"
     window.center()
     window.makeKeyAndOrderFront(nil)
     window.makeFirstResponder(view)
@@ -84,6 +84,14 @@ final class App: NSObject, NSApplicationDelegate {
       case "q": DispatchQueue.main.async { NSApp.terminate(nil) }
       case "1", "2", "3", "4", "5":
         note = p.toggle(stage: Int(k)! - 1)
+        p.scheduler?.restart()
+      case "a":  // the scheduler moves stages to the faster device (VXCAM_SCHEDULE=auto)
+        if let s = p.scheduler {
+          s.on.toggle()
+        } else {
+          p.scheduler = Scheduler(.auto, stages: p.stages.map(\.name))
+        }
+        note = ""
       default: break
       }
     }

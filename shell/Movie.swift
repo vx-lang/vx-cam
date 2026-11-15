@@ -2,6 +2,89 @@
 import AVFoundation
 import AppKit
 
+/// An H.264 movie of BGRA frames.
+final class MovieWriter {
+  private let path: String
+  private let writer: AVAssetWriter
+  private let input: AVAssetWriterInput
+  private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+  private(set) var frames = 0
+
+  init(path: String, w: Int, h: Int, start: CMTime) {
+    self.path = path
+    let url = URL(fileURLWithPath: path)
+    try? FileManager.default.removeItem(at: url)
+    guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else {
+      fatalError("cannot write \(path)")
+    }
+    input = AVAssetWriterInput(
+      mediaType: .video,
+      outputSettings: [
+        AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
+        AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000],
+      ])
+    adaptor = AVAssetWriterInputPixelBufferAdaptor(
+      assetWriterInput: input,
+      sourcePixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
+      ])
+    writer.add(input)
+    writer.startWriting()
+    writer.startSession(atSourceTime: start)
+    self.writer = writer
+  }
+
+  /// Adds a frame at `time`, which `draw` fills in.
+  func append(at time: CMTime, _ draw: (CVPixelBuffer) -> Void) {
+    var frame: CVPixelBuffer?
+    CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &frame)
+    guard let frame else { fatalError("no buffer to write frame \(frames) into") }
+    draw(frame)
+    while !input.isReadyForMoreMediaData { usleep(1000) }
+    adaptor.append(frame, withPresentationTime: time)
+    frames += 1
+  }
+
+  func finish() {
+    input.markAsFinished()
+    let done = DispatchSemaphore(value: 0)
+    writer.finishWriting { done.signal() }
+    done.wait()
+    guard writer.status == .completed else {
+      fatalError("writing \(path) failed: \(String(describing: writer.error))")
+    }
+    print("wrote \(frames) frames to \(path)")
+  }
+}
+
+/// Draws `s` with its baseline at (x, y), with CG's origin at the bottom left.
+func drawText(
+  _ ctx: CGContext, _ s: String, _ x: Double, _ y: Double, _ color: CGColor, size: CGFloat = 16,
+  bold: Bool = false
+) {
+  let font = CTFontCreateWithName((bold ? "Menlo-Bold" : "Menlo-Regular") as CFString, size, nil)
+  let attrs =
+    [
+      NSAttributedString.Key(kCTFontAttributeName as String): font,
+      NSAttributedString.Key(kCTForegroundColorAttributeName as String): color,
+    ] as [NSAttributedString.Key: Any]
+  ctx.textMatrix = .identity
+  ctx.textPosition = CGPoint(x: x, y: y)
+  CTLineDraw(
+    CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: attrs)), ctx)
+}
+
+/// A Core Graphics context that draws into a BGRA pixel buffer, which must be locked.
+func bitmapContext(_ pb: CVPixelBuffer) -> CGContext? {
+  CGContext(
+    data: CVPixelBufferGetBaseAddress(pb), width: CVPixelBufferGetWidth(pb),
+    height: CVPixelBufferGetHeight(pb), bitsPerComponent: 8,
+    bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpaceCreateDeviceRGB(),
+    bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+      | CGBitmapInfo.byteOrder32Little.rawValue)
+}
+
 /// Runs every frame of the clip once and writes the output frames to a movie, at their times.
 /// `options` may hold "mask" (the mask view), "outline" and "panel" (drawPanel). VXCAM_OVERLAP=1
 /// and VXCAM_ALTERNATE=1 run the frames as in runHeadless.
@@ -12,40 +95,16 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
   let p = Pipeline(w: w, h: h)
   p.mode = options.contains("mask") ? 1 : 0
   p.outline = options.contains("outline")
-  let url = URL(fileURLWithPath: path)
-  try? FileManager.default.removeItem(at: url)
-  guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else {
-    fatalError("cannot write \(path)")
-  }
-  let input = AVAssetWriterInput(
-    mediaType: .video,
-    outputSettings: [
-      AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
-      AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000],
-    ])
-  let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-    assetWriterInput: input,
-    sourcePixelBufferAttributes: [
-      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-      kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
-    ])
-  writer.add(input)
-  writer.startWriting()
-  writer.startSession(atSourceTime: source.time)
-  var n = 0
+  let movie = MovieWriter(path: path, w: w, h: h, start: source.time)
   func emit(_ time: CMTime) {
-    var frame: CVPixelBuffer?
-    CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &frame)
-    guard let frame else { fatalError("no buffer to write frame \(n) into") }
-    CVPixelBufferLockBaseAddress(frame, [])
-    let dst = CVPixelBufferGetBaseAddress(frame)!
-    let rowBytes = CVPixelBufferGetBytesPerRow(frame)
-    for y in 0..<h { memcpy(dst + y * rowBytes, p.out.ptr + y * w * 4, w * 4) }
-    CVPixelBufferUnlockBaseAddress(frame, [])
-    if options.contains("panel") { drawPanel(on: frame, p, fps: source.fps) }
-    while !input.isReadyForMoreMediaData { usleep(1000) }
-    adaptor.append(frame, withPresentationTime: time)
-    n += 1
+    movie.append(at: time) { frame in
+      CVPixelBufferLockBaseAddress(frame, [])
+      let dst = CVPixelBufferGetBaseAddress(frame)!
+      let rowBytes = CVPixelBufferGetBytesPerRow(frame)
+      for y in 0..<h { memcpy(dst + y * rowBytes, p.out.ptr + y * w * 4, w * 4) }
+      CVPixelBufferUnlockBaseAddress(frame, [])
+      if options.contains("panel") { drawPanel(on: frame, p, fps: source.fps) }
+    }
   }
   p.process(first)
   emit(source.time)
@@ -73,14 +132,7 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
       emit(source.time)
     }
   }
-  input.markAsFinished()
-  let done = DispatchSemaphore(value: 0)
-  writer.finishWriting { done.signal() }
-  done.wait()
-  guard writer.status == .completed else {
-    fatalError("writing \(path) failed: \(String(describing: writer.error))")
-  }
-  print("wrote \(n) frames to \(path)")
+  movie.finish()
 }
 
 /// Draws on a BGRA frame where each stage runs and how long it takes (moving averages), and
@@ -88,14 +140,7 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>) {
 func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   CVPixelBufferLockBaseAddress(pb, [])
   defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-  guard
-    let ctx = CGContext(
-      data: CVPixelBufferGetBaseAddress(pb), width: p.w, height: p.h,
-      bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-      space: CGColorSpaceCreateDeviceRGB(),
-      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-        | CGBitmapInfo.byteOrder32Little.rawValue)
-  else { return }
+  guard let ctx = bitmapContext(pb) else { return }
   let cpu = CGColor(red: 0.32, green: 0.62, blue: 1.0, alpha: 1)
   let gpu = CGColor(red: 1.0, green: 0.62, blue: 0.12, alpha: 1)
   let white = CGColor(gray: 1, alpha: 1)
@@ -103,18 +148,7 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   let black = CGColor(gray: 0, alpha: 1)
   func text(
     _ s: String, _ x: Double, _ y: Double, _ color: CGColor, size: CGFloat = 16, bold: Bool = false
-  ) {
-    let font = CTFontCreateWithName((bold ? "Menlo-Bold" : "Menlo-Regular") as CFString, size, nil)
-    let attrs =
-      [
-        NSAttributedString.Key(kCTFontAttributeName as String): font,
-        NSAttributedString.Key(kCTForegroundColorAttributeName as String): color,
-      ] as [NSAttributedString.Key: Any]
-    ctx.textMatrix = .identity
-    ctx.textPosition = CGPoint(x: x, y: y)
-    CTLineDraw(
-      CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: attrs)), ctx)
-  }
+  ) { drawText(ctx, s, x, y, color, size: size, bold: bold) }
   func box(_ r: CGRect, _ color: CGColor, radius: Double = 4) {
     ctx.setFillColor(color)
     ctx.addPath(CGPath(roundedRect: r, cornerWidth: radius, cornerHeight: radius, transform: nil))
@@ -148,7 +182,7 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   let row = 27.0
   let strip = 440.0
   let top = Double(p.h) - 20
-  let tall = row * (8.6 + Double(lanes.count))
+  let tall = row * (8.6 + Double(lanes.count) + (p.scheduler == nil ? 0 : 2))
   box(
     CGRect(x: x0 - 14, y: top - tall, width: strip + 28, height: tall),
     CGColor(gray: 0, alpha: 0.62), radius: 10)
@@ -168,6 +202,15 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
       continue
     }
     badge(st.device == "GPU", x0 + 124)
+    // A ring around the badge for a second after the scheduler moves the stage.
+    if let s = p.scheduler, let m = s.lastMove, m.stage == i, s.frame - m.frame < 30 {
+      ctx.setStrokeColor(white)
+      ctx.addPath(
+        CGPath(
+          roundedRect: CGRect(x: x0 + 121, y: y - 8, width: 52, height: 28), cornerWidth: 6,
+          cornerHeight: 6, transform: nil))
+      ctx.strokePath()
+    }
     box(
       CGRect(x: x0 + 182, y: y - 3, width: max(2, 180 * min(st.ms / budget, 1)), height: 16),
       st.device == "GPU" ? gpu : cpu, radius: 2)
@@ -203,4 +246,17 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
       : lanes.count == 1
         ? "CPU and GPU share memory: 0 bytes copied"
         : "CPU and GPU at the same time, 0 bytes copied", x0, y, dim, size: 14)
+  // The scheduler: its moves, and what its checks of the two devices found.
+  if let s = p.scheduler {
+    y -= row
+    text(
+      "the app moves stages: \(s.moves) moves, \(s.placements.count) placements", x0, y, white,
+      size: 14)
+    y -= row
+    text(
+      s.checks == 0
+        ? "every frame: the same output on either device"
+        : "\(s.checks) checks: \(s.differ) of \(s.compared.formatted()) values differ", x0, y,
+      s.differ == 0 ? white : CGColor(red: 1, green: 0.3, blue: 0.3, alpha: 1), size: 14)
+  }
 }

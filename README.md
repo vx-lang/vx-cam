@@ -158,6 +158,65 @@ idle, 10.31 ms while six `yes` processes keep the CPU busy (with almost no memor
 13.2 ms on the GPU and 10.6 ms on the CPU, against 7.0 and 7.5 ms one stage after another, and
 the GPU's model thread is busy 99% of the time. A Mac with more power to spare may gain more; that is untested.
 
+**Moving stages while the app runs.** Each stage gives the same bits on both devices, so the app
+can move any stage between two frames, and the output does not change. `VXCAM_SCHEDULE` moves
+stages while frames run one after another ([`shell/Scheduler.swift`](shell/Scheduler.swift)):
+
+- `every:10` moves one stage every 10 frames, in the order of a Gray code. In the 360 frames of
+  a run, it makes 35 moves and runs all 32 placements.
+- `auto`, or the key `a` in the window, looks for a faster placement. Every 30 frames it moves
+  one stage to the other device. After 5 frames, it takes the median frame time over 15 frames.
+  It keeps the move when the frame got more than 5% faster, and else it moves the stage back.
+  Between tries, it runs one stage on both devices over the same input and compares every value
+  that the two runs wrote.
+
+A try takes 20 frames, because one frame on the other device does not tell the time there. A GPU
+that was idle runs at a low clock. In one frame on such a GPU, segment took 16.5 ms, against
+7.4 ms on the CPU and 5.1 ms on a GPU that was busy every frame.
+
+`make bench` part 8, with Vx 24c48ad8 on 2026-11-14, with other work on the machine (load
+average 4.5 to 5). Same output means that the hash of every output frame matches the run with
+every stage on the CPU:
+
+| Clip | Start | Rule | Moves | Placements | Values that the checks compared | Values that differ | Same output |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| test clip | all on the CPU | `every:10` | 35 | 32 | 0 | 0 | yes |
+| test clip | all on the CPU | `auto` | 13 | 10 | 8,179,744 | 0 | yes |
+| test clip | all on the GPU | `auto` | 13 | 8 | 8,352,544 | 0 | yes |
+| camera recording | all on the CPU | `every:10` | 35 | 32 | 0 | 0 | yes |
+| camera recording | all on the CPU | `auto` | 13 | 9 | 8,352,544 | 0 | yes |
+| camera recording | all on the GPU | `auto` | 12 | 6 | 8,813,888 | 0 | yes |
+
+`auto` is a greedy search, and the frame times change with the load of the machine. So in 360
+frames it does not always find the fastest placement. From all on the CPU, it ended with blur and
+composite on the GPU on the test clip, and with segment, blur and composite on the GPU on the
+camera recording. From all on the GPU, it ended with all on the GPU on both clips.
+
+**Core ML and Vx, moving the model.** `make compare` writes a movie in which the model moves to
+the next device every second ([`shell/Compare.swift`](shell/Compare.swift)). Core ML runs the
+model from the packages of `tools/coreml_model.py`: on CPU only, on CPU and GPU, and on CPU and
+Neural Engine. Vx runs it on the CPU and on the GPU. Both get the same input, the one that Vx's
+model makes from the frame. Each side shows the mask, and what the move changed. That is the
+mask on the new device against the mask on the device before, for the same frame:
+
+[![Core ML's move from the CPU to the GPU changes 35,836 of 36,864 values of the mask. Vx's move changes none.](docs/compare.png)](artifacts/compare.mov)
+
+The picture is one frame of the movie of the test clip, [`artifacts/compare.mov`](artifacts/compare.mov).
+
+The values of the mask that differ between two devices, over every frame of each clip (36,864
+values a frame), with the largest difference:
+
+| Devices | Test clip, 360 frames | Camera recording, 633 frames |
+| --- | --- | --- |
+| Core ML, CPU and GPU against CPU only, both fp32 | 6,076,343 of 13,271,040, up to 7.5e-5 | 6,413,591 of 23,334,912, up to 1.5e-4 |
+| Core ML, CPU and Neural Engine (fp16) against CPU only | 6,219,821, up to 0.21 | 6,828,398, up to 0.29 |
+| Core ML, CPU and Neural Engine (fp16) against CPU and GPU | 6,032,685, up to 0.21 | 6,574,287, up to 0.29 |
+| Vx, GPU against CPU, both fp32 | 0 | 0 |
+
+The Metal log of a run over 30 frames (`VX_DISPATCH_VERBOSE=1`) counted 1,740 GPU launches, 58
+for each frame. So Vx's model ran on the GPU in each frame. Vx's model is slower than Core ML's,
+as the next table shows.
+
 **The model against TFLite and Core ML.** The mask of Vx's model matches TFLite's to within 3e-5
 on the test clip and 6e-5 on the camera recording. The same model a frame, median
 ([`tools/baseline_model.py`](tools/baseline_model.py)):
@@ -209,6 +268,10 @@ make video CLIP=record-1.mov  # write build/outline.mov (the output with the mas
                               # each stage runs and how long it takes; by default the model
                               # alternates between the GPU and the CPU (VIDEO_GPU=,
                               # VIDEO_ALTERNATE=1; see the Makefile)
+make compare TFLITE=selfie_segmentation_landscape.tflite
+              # write build/compare.mov: the model moves between devices every second, in
+              # Core ML and in Vx. The first run builds the Core ML packages from the .tflite
+              # file. Give BENCH_PYTHON= a Python with tflite and coremltools.
 make bench    # the measurements above, in build/bench/report.md (about an hour; see
               # tools/bench.py for TFLITE=, BENCH_PYTHON= and BENCH_ALSO=)
 make format   # format the Vx code with vx-format and the Swift code with swift-format
@@ -220,6 +283,9 @@ change how it runs:
 - `VXCAM_GPU=all`, or stage names separated by commas: the stages that start on the GPU.
 - `VXCAM_OVERLAP=1`: frames overlap on two threads.
 - `VXCAM_ALTERNATE=1`: the model runs on the GPU and the CPU for alternate frames.
+- `VXCAM_SCHEDULE=auto`: the app moves stages to the faster device while it runs (the key `a`
+  in the window). `VXCAM_SCHEDULE=every:N` moves one stage every N frames.
+  `VXCAM_SCHEDULE_LOG=1` prints each move and each check.
 - `VXCAM_HASH=1`: print a hash of every output frame.
 - `VXCAM_VIEW=mask` or `noblur`, and `VXCAM_OUTLINE=1`: what the output shows (the keys `m`,
   `b` and `e` in the window).
@@ -232,8 +298,8 @@ To record a clip, use QuickTime Player (File > New Movie Recording) and save it 
 folder. `.gitignore` keeps `*.mov` files here out of git.
 
 Keys in the window: `m` mask view, `e` outline (the mask's edge), `b` blur off, `f` auto-framing off, `1`-`5` move a
-stage between the CPU and the GPU, `r` learn the background again (stand-in only), `o` overlay,
-space pause, `q` quit.
+stage between the CPU and the GPU, `a` let the app move the stages, `r` learn the background
+again (stand-in only), `o` overlay, space pause, `q` quit.
 
 ## Layout
 
@@ -246,14 +312,16 @@ space pause, `q` quit.
 | `shell/main.swift` | The host shell's command line. The shell has no compute |
 | `shell/Pipeline.swift` | The buffers, and the Vx stages called one frame at a time |
 | `shell/Schedules.swift` | Frames on two or three threads (`VXCAM_OVERLAP`, `VXCAM_ALTERNATE`) |
+| `shell/Scheduler.swift` | Moves stages between the devices while the app runs (`VXCAM_SCHEDULE`) |
 | `shell/Headless.swift`, `Movie.swift`, `Window.swift` | `--headless`, `--write`, and the window with its overlay and keys |
+| `shell/Compare.swift` | `--compare`: a movie of the model moving between devices, in Core ML and in Vx |
 | `shell/Sources.swift` | Frames from a movie file or the camera |
 | `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera |
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
 | `models/` | The segmentation model's weights, its license and where it comes from |
 | `tools/convert_model.py` | Writes those weights from Google's .tflite file |
 | `tools/check_model.py` | Compares vx-cam's mask with TFLite's, on the frames that `--headless` writes |
-| `tools/bench.py` | `make bench`: bits, placements, overlap, launches and copies, the model against TFLite and Core ML, the model on both devices |
+| `tools/bench.py` | `make bench`: bits, placements, overlap, launches and copies, the model against TFLite and Core ML, the model on both devices, stages that move while the app runs |
 | `tools/baseline_model.py` | Times the model in TFLite and Core ML, and checks their masks against TFLite's |
 | `tools/coreml_model.py` | Builds the Core ML model from the .tflite file, layer by layer |
 

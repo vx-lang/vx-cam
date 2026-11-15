@@ -26,6 +26,9 @@
 7. The model on both devices: the model runs on the GPU for even frames and on the CPU for odd
    ones (VXCAM_ALTERNATE=1), with each of the 8 placements of the stages after it, against all on
    the GPU, taken in turn, and each output hash against all on the CPU.
+8. Moving stages while the app runs (VXCAM_SCHEDULE): a move every 10 frames, which visits all
+   32 placements, and the scheduler from all on the CPU and from all on the GPU. Each output hash
+   against all on the CPU, and the checks of the two devices that the scheduler made.
 
 It waits until the load average is below --quiet (3 by default, up to 30 minutes) before each
 part and each round of placements, and records the load before and after each. Other work on the machine shows up in the numbers.
@@ -58,7 +61,7 @@ p.add_argument("--vx", default=os.path.expanduser("~/go/Vx"),
                help="the Vx checkout that built vxc, if build/vx-commit.txt is missing")
 p.add_argument("--only", help="parts to run, such as 1,2 (default: all)")
 args = p.parse_args()
-parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5, 6, 7}
+parts = set(int(x) for x in args.only.split(",")) if args.only else {1, 2, 3, 4, 5, 6, 7, 8}
 os.makedirs(OUT, exist_ok=True)
 BIN = os.path.join(ROOT, "build", "vx-cam")
 
@@ -121,6 +124,12 @@ def parse(text):
                               "busy": [int(m.group(k)) for k in (3, 4, 5)]}
         if m := re.match(r"^output hash: (\w+)", line):
             r["hash"] = m.group(1)
+        if m := re.match(r"^scheduler: .+?: (\d+) tries, (\d+) kept, (\d+) moves, (\d+) checks, (\d+) of (\d+) "
+                         r"values differ, (\d+) placements", line):
+            r["scheduler"] = dict(zip(("tries", "kept", "moves", "checks", "differ", "compared", "placements"),
+                                      (int(x) for x in m.groups())))
+        if m := re.match(r"^on the GPU at the end: (.+)", line):
+            r["ended_on_gpu"] = [] if m.group(1) == "none" else m.group(1).split(", ")
         if m := re.match(r"^(.+) CPU vs GPU: (\d+) of (\d+) values differ \(largest difference (.+)\)", line):
             r.setdefault("diffs", []).append({"buffer": m.group(1), "differ": int(m.group(2)),
                                               "total": int(m.group(3)), "worst": float(m.group(4))})
@@ -273,6 +282,21 @@ if 7 in parts:
     results["load"]["alternate"].append(load())
     print("part 7: alternate done")
 
+if 8 in parts:
+    results["load"]["scheduler"] = [wait_quiet()]
+    rows = []
+    for clip in [args.clip] + ([args.also] if args.also else []):
+        reference = parse(run("", clip=clip, env={"VXCAM_HASH": "1"}))["hash"]
+        for start, rule in (([], "every:10"), ([], "auto"), (STAGES, "auto")):
+            g = "all" if start == STAGES else ""
+            r = parse(run(g, clip=clip, env={"VXCAM_HASH": "1", "VXCAM_SCHEDULE": rule}))
+            rows.append({"clip": os.path.basename(clip), "start": label(start), "rule": rule, **r["scheduler"],
+                         "wall": r["wall"], "ended_on_gpu": r["ended_on_gpu"],
+                         "same_output_as_all_cpu": r["hash"] == reference})
+    results["scheduler"] = rows
+    results["load"]["scheduler"].append(load())
+    print("part 8: scheduler", [(r["rule"], r["start"], r["same_output_as_all_cpu"]) for r in rows])
+
 json.dump(results, open(os.path.join(OUT, "results.json"), "w"), indent=1)
 
 # The report.
@@ -396,6 +420,21 @@ if "alternate" in results:
                  f"| {busy} | {'yes' if r['same_output_as_all_cpu'] else 'NO'} |")
     L += ["", "With the model alternating, the GPU and the CPU each run it on every other frame, so preprocess "
               "and segment are in the alternating threads and the stages on the GPU are the rest.", ""]
+
+if "scheduler" in results:
+    L += ["## 8. Moving stages while the app runs", "",
+          "The scheduler moves stages while frames run one after another (VXCAM_SCHEDULE). `every:10` moves one "
+          "stage every 10 frames and visits all 32 placements. `auto` tries each stage on the other device and "
+          "keeps the moves that make the frame faster. Between tries, it runs one stage on both devices over "
+          "the same input and compares what they wrote.", "",
+          "| Clip | Start | Rule | Moves | Placements | Checks | Values that differ | Wall ms "
+          "| On the GPU at the end | Same output as all CPU |",
+          "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- | --- |"]
+    for r in results["scheduler"]:
+        L.append(f"| {r['clip']} | {r['start']} | `{r['rule']}` | {r['moves']} | {r['placements']} | {r['checks']} "
+                 f"| {r['differ']} of {r['compared']:,} | {r['wall']:.2f} | {', '.join(r['ended_on_gpu']) or 'none'} "
+                 f"| {'yes' if r['same_output_as_all_cpu'] else 'NO'} |")
+    L.append("")
 
 open(os.path.join(OUT, "report.md"), "w").write("\n".join(L))
 print("wrote", os.path.join(OUT, "report.md"))
