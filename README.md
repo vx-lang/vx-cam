@@ -201,6 +201,8 @@ mask on the new device against the mask on the device before, for the same frame
 
 [![Core ML's move from the CPU to the GPU changes 35,836 of 36,864 values of the mask. Vx's move changes none.](docs/compare.png)](artifacts/compare.mov)
 
+https://github.com/user-attachments/assets/711d8dc9-1954-4cfb-b7f2-f9227d8e7366
+
 The picture is one frame of the movie of the test clip, [`artifacts/compare.mov`](artifacts/compare.mov).
 
 The values of the mask that differ between two devices, over every frame of each clip (36,864
