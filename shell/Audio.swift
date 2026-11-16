@@ -1,6 +1,7 @@
 // Audio.swift - Noise removal: the Vx filter of pipeline/denoise.vx, audio from a file or the
 // microphone, and playback.
 import AVFoundation
+import Synchronization
 
 /// RNNoise in Vx (pipeline/denoise.vx): one frame of 10 ms at a time, on the CPU. Its weights
 /// are rnnoise.f32 next to the binary (models/README.md).
@@ -13,11 +14,19 @@ final class Denoiser {
   private let stats = Shared<Float>(count: Int(VXCAM_DENOISE_STATS))
   private let input = Shared<Float>(count: frame)
   private let output = Shared<Float>(count: frame)
-  /// With `enabled` false, the frames pass through with the same delay of 10 ms.
-  var enabled = true
-  /// The time of the last frames, in ms, and the probability of a voice in the last frame.
-  private(set) var times: [Double] = []
+  /// The probability of a voice in the last frame.
   private(set) var voice: Float = 0
+  /// The window reads `enabled` and the times while another thread cleans the audio, so both go
+  /// through `lock`.
+  private let lock = NSLock()
+  private var on = true
+  private var times: [Double] = []  // the time of the last frames, in ms
+
+  /// With `enabled` false, the frames pass through with the same delay of 10 ms.
+  var enabled: Bool {
+    get { lock.withLock { on } }
+    set { lock.withLock { on = newValue } }
+  }
 
   /// nil when rnnoise.f32 is not next to the binary.
   init?() {
@@ -36,8 +45,11 @@ final class Denoiser {
     let t0 = nowMs()
     vxcam_denoise_frame(
       output.ptr, input.ptr, state.ptr, weights.ptr, tables.ptr, stats.ptr, enabled ? 1 : 0)
-    times.append(nowMs() - t0)
-    if times.count > 1000 { times.removeFirst(500) }
+    let ms = nowMs() - t0
+    lock.withLock {
+      times.append(ms)
+      if times.count > 1000 { times.removeFirst(500) }
+    }
     voice = stats.ptr[0]
     memcpy(dst, output.ptr, Denoiser.frame * 4)
   }
@@ -50,8 +62,9 @@ final class Denoiser {
     for i in 0..<Denoiser.frame { samples[i] = raw[i] / 32768 }
   }
 
-  /// The median time of a frame over the last frames, in ms.
-  var medianMs: Double { times.isEmpty ? 0 : times.sorted()[times.count / 2] }
+  /// The time of the last frame, and the median time of a frame over the last frames, in ms.
+  var lastMs: Double { lock.withLock { times.last ?? 0 } }
+  var medianMs: Double { lock.withLock { times.isEmpty ? 0 : times.sorted()[times.count / 2] } }
 }
 
 /// The audio of a file (a sound file or a movie) as 48 kHz mono samples from -1 to 1.
@@ -133,7 +146,7 @@ func runDenoise(from input: String, to output: String) {
     out.withUnsafeMutableBufferPointer { dst in
       for k in 0..<frames {
         d.processRaw(src.baseAddress! + k * Denoiser.frame, dst.baseAddress! + k * Denoiser.frame)
-        times.append(d.times.last!)
+        times.append(d.lastMs)
         if d.voice > 0.5 { voiced += 1 }
       }
     }
@@ -205,7 +218,12 @@ final class AudioStream {
 /// the speakers next to the microphone make a loop.
 final class LiveAudio {
   let stream: AudioStream
-  var playing = false
+  /// The speakers' thread reads this and cannot wait for a lock, so it is atomic.
+  private let play = Atomic<Bool>(false)
+  var playing: Bool {
+    get { play.load(ordering: .relaxed) }
+    set { play.store(newValue, ordering: .relaxed) }
+  }
   private let engine = AVAudioEngine()
   private let mono = AVAudioFormat(
     commonFormat: .pcmFormatFloat32, sampleRate: Denoiser.rate, channels: 1, interleaved: false)!

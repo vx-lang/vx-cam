@@ -44,6 +44,10 @@ final class MovieWriter {
         ])
       writer.add(a)
       audioInput = a
+      // With two inputs, the writer can hold one back until the other catches up, and this
+      // thread waits for each in turn. Inputs that expect data in real time are not held back.
+      input.expectsMediaDataInRealTime = true
+      a.expectsMediaDataInRealTime = true
     }
     writer.startWriting()
     writer.startSession(atSourceTime: start)
@@ -348,6 +352,6 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double, audio: String? 
 /// A line about the noise removal for the panel and the overlay.
 func audioLine(_ d: Denoiser) -> String {
   String(
-    format: "noise removal %@: Vx on the CPU, %.2f ms a frame of 10 ms", d.enabled ? "on" : "off",
+    format: "noise removal %@: CPU, %.2f ms for 10 ms of sound", d.enabled ? "on" : "off",
     d.medianMs)
 }
