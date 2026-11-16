@@ -5,6 +5,12 @@ auto-framing, with each stage placed on the CPU or the GPU of a MacBook. The pla
 [`vx-cam-laptop-heterogeneous-proposal.md`](vx-cam-laptop-heterogeneous-proposal.md), filed as
 [vx-lang/Vx#2688](https://github.com/vx-lang/Vx/issues/2688).
 
+https://github.com/user-attachments/assets/33ab1bb1-ff01-4ae8-998b-349e8f02403a
+
+`make demo` wrote this movie. Every 56 frames, the app moves one stage to the other device, and
+it visits all 32 placements. The output does not change: the checks of the two devices find 0
+values that differ.
+
 ## Status
 
 All five stages are Vx, and every stage is GPU kernels that run on the Apple GPU or, from the
