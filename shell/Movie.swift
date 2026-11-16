@@ -18,7 +18,7 @@ final class MovieWriter {
       fatalError("cannot write \(path)")
     }
     let rate = env("VXCAM_BITRATE").map { Int($0) ?? 0 } ?? 8_000_000
-    precondition(rate > 0, "VXCAM_BITRATE must be a number of bits a second above 0")
+    if rate <= 0 { fatalError("VXCAM_BITRATE must be a number of bits a second above 0") }
     input = AVAssetWriterInput(
       mediaType: .video,
       outputSettings: [
