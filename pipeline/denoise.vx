@@ -1,0 +1,1044 @@
+//===- denoise.vx - Noise removal for the microphone of vx-cam ---*- Vx -*-===//
+//
+// RNNoise v0.1.1, ported from its C code. Each call cleans one frame of 10 ms:
+// 480 samples at 48 kHz, with the values of 16-bit audio.
+//
+// Copyright (c) 2017, Mozilla
+// Copyright (c) 2007-2017, Jean-Marc Valin
+// Copyright (c) 2005-2017, Xiph.Org Foundation
+// Copyright (c) 2003-2004, Mark Borgerding
+// Under the BSD license of RNNoise, in models/LICENSE-rnnoise. See models/README.md.
+//
+// For each frame: a high-pass filter, a window of 20 ms and an FFT, the energy
+// of 22 bands, a search for the pitch, 42 features, a recurrent network that
+// gives a gain for each band, a comb filter at the pitch, the gains, and the
+// inverse FFT with overlap-add. The output is 10 ms behind the input.
+//
+// The C code mixes float and double. Where it computes in double, this code
+// computes in f64, so that the two stay close. The work of a frame is small and
+// each step needs the state of the step before, so it all runs on the CPU.
+//
+//===----------------------------------------------------------------------===//
+
+import core::convert;
+import core::num;
+
+const FRAME : i32 = 480;
+const WINDOW : i32 = 960;
+const FREQ : i32 = 481;
+const BANDS : i32 = 22;
+
+// The state of the filter, from one frame to the next: [1, STATE_SIZE].
+const S_ANALYSIS : i32 = 0; // 480: the last input frame
+const S_CEPS : i32 = 480; // 8 x 22: the cepstrum of the last 8 frames
+const S_SYNTH : i32 = 656; // 480: the second half of the last output window
+const S_PITCH : i32 = 1136; // 1728: the input of the pitch search
+const S_HP : i32 = 2864; // 2: the high-pass filter
+const S_LASTG : i32 = 2866; // 22: the last gains
+const S_VAD : i32 = 2888; // 24: the GRU of voice activity
+const S_NOISE : i32 = 2912; // 48: the GRU of the noise
+const S_DENOISE : i32 = 2960; // 96: the GRU of the gains
+const S_LAST_GAIN : i32 = 3056; // the last pitch gain
+const S_MEMID : i32 = 3057; // the next row of S_CEPS
+const S_LAST_PERIOD : i32 = 3058; // the last pitch period
+const STATE_SIZE : i32 = 3059;
+
+// The tables of vxcam_denoise_init: [1, TABLES_SIZE].
+const T_WINDOW : i32 = 0; // 480: half of the window
+const T_DCT : i32 = 480; // 22 x 22
+const T_COS : i32 = 964; // 960: the twiddles of the FFT, cos(-2 pi i / 960)
+const T_SIN : i32 = 1924; // 960: and sin(-2 pi i / 960)
+const T_EBAND : i32 = 2884; // 22: the first FFT bin of each band, / 4
+const T_SECOND : i32 = 2906; // 16: second_check of the pitch search
+const TABLES_SIZE : i32 = 2922;
+
+// The weights of models/rnnoise.f32 (tools/convert_rnnoise.py).
+const W_INPUT_DENSE : i32 = 0; // 42 x 24, then 24
+const W_VAD_GRU : i32 = 1032; // 24 x 72, 24 x 72, then 72
+const W_VAD_OUTPUT : i32 = 4560; // 24 x 1, then 1
+const W_NOISE_GRU : i32 = 4585; // 90 x 144, 48 x 144, then 144
+const W_DENOISE_GRU : i32 = 24601; // 114 x 288, 96 x 288, then 288
+const W_DENOISE_OUTPUT : i32 = 85369; // 96 x 22, then 22
+const W_TANH : i32 = 87503; // 201: tanh(i / 25), as RNNoise rounds it
+const WEIGHTS_SIZE : i32 = 87704;
+
+fn abs_i32(v : i32) -> i32 {
+  if v < 0 {
+    return 0 - v;
+  }
+  return v;
+}
+
+fn max32(a : f32, b : f32) -> f32 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+fn min32(a : f32, b : f32) -> f32 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn max64(a : f64, b : f64) -> f64 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+// The first FFT bin of band i.
+fn band(t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, i : i32) -> i32 {
+  return (t[0][T_EBAND + i] as i32) * 4;
+}
+
+fn denoise_tables(t : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  assert(t.extent(1) == TABLES_SIZE, "the tables of the noise removal hold 2922 floats");
+  let pi : f64 = 3.14159265358979323846;
+  for i in 0..FRAME {
+    let s = (0.5 * pi * ((i as f64) + 0.5) / 480.0).sin();
+    t[0][T_WINDOW + i] = (0.5 * pi * s * s).sin() as f32;
+  }
+  let half : f64 = 0.5;
+  for i in 0..BANDS {
+    for j in 0..BANDS {
+      let mut v = (((i as f64) + 0.5) * (j as f64) * pi / 22.0).cos() as f32;
+      if j == 0 {
+        v = ((v as f64) * half.sqrt()) as f32;
+      }
+      t[0][T_DCT + i * BANDS + j] = v;
+    }
+  }
+  let step : f64 = (0.0 - 2.0 * pi) / 960.0;
+  for i in 0..WINDOW {
+    let phase = step * (i as f64);
+    t[0][T_COS + i] = phase.cos() as f32;
+    t[0][T_SIN + i] = phase.sin() as f32;
+  }
+  // eband5ms of RNNoise: 0 to 20 kHz in 22 bands.
+  t[0][T_EBAND] = 0.0;
+  t[0][T_EBAND + 1] = 1.0;
+  t[0][T_EBAND + 2] = 2.0;
+  t[0][T_EBAND + 3] = 3.0;
+  t[0][T_EBAND + 4] = 4.0;
+  t[0][T_EBAND + 5] = 5.0;
+  t[0][T_EBAND + 6] = 6.0;
+  t[0][T_EBAND + 7] = 7.0;
+  t[0][T_EBAND + 8] = 8.0;
+  t[0][T_EBAND + 9] = 10.0;
+  t[0][T_EBAND + 10] = 12.0;
+  t[0][T_EBAND + 11] = 14.0;
+  t[0][T_EBAND + 12] = 16.0;
+  t[0][T_EBAND + 13] = 20.0;
+  t[0][T_EBAND + 14] = 24.0;
+  t[0][T_EBAND + 15] = 28.0;
+  t[0][T_EBAND + 16] = 34.0;
+  t[0][T_EBAND + 17] = 40.0;
+  t[0][T_EBAND + 18] = 48.0;
+  t[0][T_EBAND + 19] = 60.0;
+  t[0][T_EBAND + 20] = 78.0;
+  t[0][T_EBAND + 21] = 100.0;
+  // second_check: {0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3, 2}.
+  for k in 0..16 {
+    let mut v : f32 = 2.0;
+    if k < 2 {
+      v = 0.0;
+    } else if k == 6 || k == 12 {
+      v = 5.0;
+    } else if k % 2 == 0 {
+      v = 3.0;
+    }
+    t[0][T_SECOND + k] = v;
+  }
+  return;
+}
+
+// n with its 6 bits in the other order.
+fn reverse6(n : i32) -> i32 {
+  let mut r : i32 = 0;
+  let mut v = n;
+  for b in 0..6 {
+    r = r * 2 + v % 2;
+    v = v / 2;
+  }
+  return r;
+}
+
+// out = the FFT of (in_re, in_im) with 960 points, divided by 960 as in RNNoise:
+// out[k] = sum over n of in[n] e^(-2 pi i n k / 960) / 960. 960 is 64 * 15: an
+// FFT of 64 points (radix 2) of each of the 15 sequences in[15 n1 + n2], the
+// twiddles e^(-2 pi i n2 k1 / 960), then a DFT of 15 points for each bin k1.
+fn fft960(out_re : &mut Tensor<f32, [960]>, out_im : &mut Tensor<f32, [960]>,
+in_re : &Tensor<f32, [960]>, in_im : &Tensor<f32, [960]>,
+t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  let scale : f32 = 1.0 / 960.0;
+  let mut a_re = Tensor<f32, [960]>::fill(0.0);
+  let mut a_im = Tensor<f32, [960]>::fill(0.0);
+  for n2 in 0..15 {
+    for n1 in 0..64 {
+      let at = n2 * 64 + reverse6(n1);
+      a_re[at] = scale * in_re[15 * n1 + n2];
+      a_im[at] = scale * in_im[15 * n1 + n2];
+    }
+    let mut half : i32 = 1;
+    while half < 64 {
+      let m = half * 2;
+      for start in 0..64 / m {
+        for k in 0..half {
+          // e^(-2 pi i k / m) = e^(-2 pi i (15 * 64 / m) k / 960)
+          let tw = 15 * (64 / m) * k;
+          let wr = t[0][T_COS + tw];
+          let wi = t[0][T_SIN + tw];
+          let p = n2 * 64 + start * m + k;
+          let q = p + half;
+          let br = a_re[q] * wr - a_im[q] * wi;
+          let bi = a_re[q] * wi + a_im[q] * wr;
+          let ar = a_re[p];
+          let ai = a_im[p];
+          a_re[p] = ar + br;
+          a_im[p] = ai + bi;
+          a_re[q] = ar - br;
+          a_im[q] = ai - bi;
+        }
+      }
+      half = m;
+    }
+    for k1 in 0..64 {
+      let tw = n2 * k1;
+      let wr = t[0][T_COS + tw];
+      let wi = t[0][T_SIN + tw];
+      let p = n2 * 64 + k1;
+      let xr = a_re[p];
+      let xi = a_im[p];
+      a_re[p] = xr * wr - xi * wi;
+      a_im[p] = xr * wi + xi * wr;
+    }
+  }
+  for k1 in 0..64 {
+    for k2 in 0..15 {
+      let mut sr : f32 = 0.0;
+      let mut si : f32 = 0.0;
+      for n2 in 0..15 {
+        // e^(-2 pi i n2 k2 / 15) = e^(-2 pi i 64 (n2 k2 mod 15) / 960)
+        let tw = 64 * ((n2 * k2) % 15);
+        let wr = t[0][T_COS + tw];
+        let wi = t[0][T_SIN + tw];
+        let p = n2 * 64 + k1;
+        sr = sr + (a_re[p] * wr - a_im[p] * wi);
+        si = si + (a_re[p] * wi + a_im[p] * wr);
+      }
+      out_re[k1 + 64 * k2] = sr;
+      out_im[k1 + 64 * k2] = si;
+    }
+  }
+  return;
+}
+
+// The spectrum of a real window x, bins 0 to 480.
+fn forward_transform(out_re : &mut Tensor<f32, [960]>, out_im : &mut Tensor<f32, [960]>,
+x : &Tensor<f32, [960]>, t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  let zero = Tensor<f32, [960]>::fill(0.0);
+  fft960(out_re, out_im, x, &zero, t);
+  return;
+}
+
+// The real window whose spectrum has bins 0 to 480 of (in_re, in_im).
+fn inverse_transform(out : &mut Tensor<f32, [960]>, in_re : &Tensor<f32, [960]>,
+in_im : &Tensor<f32, [960]>, t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  let mut x_re = Tensor<f32, [960]>::fill(0.0);
+  let mut x_im = Tensor<f32, [960]>::fill(0.0);
+  for i in 0..FREQ {
+    x_re[i] = in_re[i];
+    x_im[i] = in_im[i];
+  }
+  for i in FREQ..WINDOW {
+    x_re[i] = x_re[WINDOW - i];
+    x_im[i] = 0.0 - x_im[WINDOW - i];
+  }
+  let mut y_re = Tensor<f32, [960]>::fill(0.0);
+  let mut y_im = Tensor<f32, [960]>::fill(0.0);
+  fft960(&mut y_re, &mut y_im, &x_re, &x_im, t);
+  // The FFT of the spectrum, in the other order, is the window times 960.
+  out[0] = 960.0 * y_re[0];
+  for i in 1..WINDOW {
+    out[i] = 960.0 * y_re[WINDOW - i];
+  }
+  return;
+}
+
+fn apply_window(x : &mut Tensor<f32, [960]>, t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  for i in 0..FRAME {
+    x[i] = x[i] * t[0][T_WINDOW + i];
+    x[WINDOW - 1 - i] = x[WINDOW - 1 - i] * t[0][T_WINDOW + i];
+  }
+  return;
+}
+
+// The energy of each band: each bin counts toward its two nearest bands.
+fn band_energy(e : &mut Tensor<f32, [22]>, xr : &Tensor<f32, [960]>, xi : &Tensor<f32, [960]>,
+t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  for i in 0..BANDS {
+    e[i] = 0.0;
+  }
+  for i in 0..BANDS - 1 {
+    let lo = band(t, i);
+    let size = band(t, i + 1) - lo;
+    for j in 0..size {
+      let frac = (j as f32) / (size as f32);
+      let mut tmp = xr[lo + j] * xr[lo + j];
+      tmp = tmp + xi[lo + j] * xi[lo + j];
+      e[i] = e[i] + (1.0 - frac) * tmp;
+      e[i + 1] = e[i + 1] + frac * tmp;
+    }
+  }
+  e[0] = e[0] * 2.0;
+  e[BANDS - 1] = e[BANDS - 1] * 2.0;
+  return;
+}
+
+// The same for the product of the spectra x and p.
+fn band_corr(e : &mut Tensor<f32, [22]>, xr : &Tensor<f32, [960]>, xi : &Tensor<f32, [960]>,
+pr : &Tensor<f32, [960]>, pi : &Tensor<f32, [960]>, t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  for i in 0..BANDS {
+    e[i] = 0.0;
+  }
+  for i in 0..BANDS - 1 {
+    let lo = band(t, i);
+    let size = band(t, i + 1) - lo;
+    for j in 0..size {
+      let frac = (j as f32) / (size as f32);
+      let mut tmp = xr[lo + j] * pr[lo + j];
+      tmp = tmp + xi[lo + j] * pi[lo + j];
+      e[i] = e[i] + (1.0 - frac) * tmp;
+      e[i + 1] = e[i + 1] + frac * tmp;
+    }
+  }
+  e[0] = e[0] * 2.0;
+  e[BANDS - 1] = e[BANDS - 1] * 2.0;
+  return;
+}
+
+// A gain for each bin from a gain for each band. Bins 400 and up, above 20 kHz,
+// get 0, as in RNNoise, where only the first 120 floats are set to 0 first.
+fn interp_band_gain(g : &mut Tensor<f32, [960]>, e : &Tensor<f32, [22]>,
+t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  for i in 0..FREQ {
+    g[i] = 0.0;
+  }
+  for i in 0..BANDS - 1 {
+    let lo = band(t, i);
+    let size = band(t, i + 1) - lo;
+    for j in 0..size {
+      let frac = (j as f32) / (size as f32);
+      g[lo + j] = (1.0 - frac) * e[i] + frac * e[i + 1];
+    }
+  }
+  return;
+}
+
+fn dct(out : &mut Tensor<f32, [22]>, v : &Tensor<f32, [22]>,
+t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  let scale : f64 = 2.0 / 22.0;
+  for i in 0..BANDS {
+    let mut sum : f32 = 0.0;
+    for j in 0..BANDS {
+      sum = sum + v[j] * t[0][T_DCT + j * BANDS + i];
+    }
+    out[i] = ((sum as f64) * scale.sqrt()) as f32;
+  }
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// The pitch search (pitch.c and celt_lpc.c of RNNoise, float version).
+//===----------------------------------------------------------------------===//
+
+// ac[k] = the sum of x[i] x[i + k] over the first 864 values, for k up to 4.
+fn autocorr(ac : &mut Tensor<f32, [5]>, x : &Tensor<f32, [864]>) -> void {
+  let n : i32 = 864;
+  let fast = n - 4;
+  for k in 0..5 {
+    let mut sum : f32 = 0.0;
+    for j in 0..fast {
+      sum = sum + x[j] * x[j + k];
+    }
+    let mut d : f32 = 0.0;
+    let tail = k + fast;
+    for i in tail..n {
+      d = d + x[i] * x[i - k];
+    }
+    ac[k] = sum + d;
+  }
+  return;
+}
+
+// The LPC of order 4 from the autocorrelation (Levinson-Durbin).
+fn lpc4(lpc : &mut Tensor<f32, [4]>, ac : &Tensor<f32, [5]>) -> void {
+  let mut error = ac[0];
+  for i in 0..4 {
+    lpc[i] = 0.0;
+  }
+  if ac[0] != 0.0 {
+    let mut i : i32 = 0;
+    while i < 4 {
+      let mut rr : f32 = 0.0;
+      for j in 0..i {
+        rr = rr + lpc[j] * ac[i - j];
+      }
+      rr = rr + ac[i + 1];
+      let r = (0.0 - rr) / error;
+      lpc[i] = r;
+      for j in 0..(i + 1) / 2 {
+        let tmp1 = lpc[j];
+        let tmp2 = lpc[i - 1 - j];
+        lpc[j] = tmp1 + r * tmp2;
+        lpc[i - 1 - j] = tmp2 + r * tmp1;
+      }
+      error = error - r * r * error;
+      if error < 0.001 * ac[0] {
+        i = 4;
+      } else {
+        i = i + 1;
+      }
+    }
+  }
+  return;
+}
+
+// x_lp = the 1728 samples of the pitch buffer at half the rate, whitened by an
+// LPC filter of order 4 with an extra zero.
+fn pitch_downsample(x_lp : &mut Tensor<f32, [864]>, st : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  for i in 1..864 {
+    x_lp[i] = 0.5 * (0.5 * (st[0][S_PITCH + 2 * i - 1] + st[0][S_PITCH + 2 * i + 1])
+    + st[0][S_PITCH + 2 * i]);
+  }
+  x_lp[0] = 0.5 * (0.5 * st[0][S_PITCH + 1] + st[0][S_PITCH]);
+  let mut ac = Tensor<f32, [5]>::fill(0.0);
+  autocorr(&mut ac, x_lp);
+  ac[0] = ac[0] * 1.0001;
+  for i in 1..5 {
+    let w = 0.008 * (i as f32);
+    ac[i] = ac[i] - ac[i] * w * w;
+  }
+  let mut lpc = Tensor<f32, [4]>::fill(0.0);
+  lpc4(&mut lpc, &ac);
+  let mut tmp : f32 = 1.0;
+  for i in 0..4 {
+    tmp = 0.9 * tmp;
+    lpc[i] = lpc[i] * tmp;
+  }
+  let c1 : f32 = 0.8;
+  let n0 = lpc[0] + 0.8;
+  let n1 = lpc[1] + c1 * lpc[0];
+  let n2 = lpc[2] + c1 * lpc[1];
+  let n3 = lpc[3] + c1 * lpc[2];
+  let n4 = c1 * lpc[3];
+  let mut m0 : f32 = 0.0;
+  let mut m1 : f32 = 0.0;
+  let mut m2 : f32 = 0.0;
+  let mut m3 : f32 = 0.0;
+  let mut m4 : f32 = 0.0;
+  for i in 0..864 {
+    let xi = x_lp[i];
+    let mut sum = xi;
+    sum = sum + n0 * m0;
+    sum = sum + n1 * m1;
+    sum = sum + n2 * m2;
+    sum = sum + n3 * m3;
+    sum = sum + n4 * m4;
+    m4 = m3;
+    m3 = m2;
+    m2 = m1;
+    m1 = m0;
+    m0 = xi;
+    x_lp[i] = sum;
+  }
+  return;
+}
+
+// best[0] and best[1]: the two lags i below max_pitch with the largest
+// xcorr[i]^2 / (the energy of y over [i, i + len)).
+fn find_best_pitch(best : &mut Tensor<i32, [2]>, xcorr : &Tensor<f32, [294]>, y : &Tensor<f32, [864]>,
+yoff : i32, len : i32, max_pitch : i32) -> void {
+  let mut syy : f32 = 1.0;
+  let mut num0 : f32 = 0.0 - 1.0;
+  let mut num1 : f32 = 0.0 - 1.0;
+  let mut den0 : f32 = 0.0;
+  let mut den1 : f32 = 0.0;
+  best[0] = 0;
+  best[1] = 1;
+  for j in 0..len {
+    syy = syy + y[yoff + j] * y[yoff + j];
+  }
+  for i in 0..max_pitch {
+    if xcorr[i] > 0.0 {
+      let x16 = xcorr[i] * 0.000000000001;
+      let num = x16 * x16;
+      if num * den1 > num1 * syy {
+        if num * den0 > num0 * syy {
+          num1 = num0;
+          den1 = den0;
+          best[1] = best[0];
+          num0 = num;
+          den0 = syy;
+          best[0] = i;
+        } else {
+          num1 = num;
+          den1 = syy;
+          best[1] = i;
+        }
+      }
+    }
+    syy = syy + (y[yoff + i + len] * y[yoff + i + len] - y[yoff + i] * y[yoff + i]);
+    syy = max32(1.0, syy);
+  }
+  return;
+}
+
+// The pitch lag of the frame, from the 1/2-rate signal x_lp: a search at 1/4
+// rate, then at 1/2 rate near the two best lags, then a half-sample step.
+// RNNoise calls this with x = x_lp + 384, y = x_lp, len 960 and max_pitch 588.
+fn pitch_search(x_lp : &Tensor<f32, [864]>) -> i32 {
+  let mut x4 = Tensor<f32, [864]>::fill(0.0);
+  let mut y4 = Tensor<f32, [864]>::fill(0.0);
+  for j in 0..240 {
+    x4[j] = x_lp[384 + 2 * j];
+  }
+  for j in 0..387 {
+    y4[j] = x_lp[2 * j];
+  }
+  let mut xcorr = Tensor<f32, [294]>::fill(0.0);
+  for i in 0..147 {
+    let mut sum : f32 = 0.0;
+    for j in 0..240 {
+      sum = sum + x4[j] * y4[i + j];
+    }
+    xcorr[i] = sum;
+  }
+  let mut best = Tensor<i32, [2]>::fill(0);
+  find_best_pitch(&mut best, &xcorr, &y4, 0, 240, 147);
+  for i in 0..294 {
+    xcorr[i] = 0.0;
+    if abs_i32(i - 2 * best[0]) <= 2 || abs_i32(i - 2 * best[1]) <= 2 {
+      let mut sum : f32 = 0.0;
+      for j in 0..480 {
+        sum = sum + x_lp[384 + j] * x_lp[i + j];
+      }
+      xcorr[i] = max32(0.0 - 1.0, sum);
+    }
+  }
+  find_best_pitch(&mut best, &xcorr, x_lp, 0, 480, 294);
+  let mut offset : i32 = 0;
+  if best[0] > 0 && best[0] < 293 {
+    let a = xcorr[best[0] - 1];
+    let b = xcorr[best[0]];
+    let c = xcorr[best[0] + 1];
+    if c - a > 0.7 * (b - a) {
+      offset = 1;
+    } else if a - c > 0.7 * (b - c) {
+      offset = 0 - 1;
+    }
+  }
+  return 2 * best[0] - offset;
+}
+
+fn pitch_gain(xy : f32, xx : f32, yy : f32) -> f32 {
+  let d = (1.0 + xx * yy) as f64;
+  return ((xy as f64) / d.sqrt()) as f32;
+}
+
+// The sum of x[384 + i] x[384 + i - lag] for i below 480.
+fn inner(x : &Tensor<f32, [864]>, lag : i32) -> f32 {
+  let mut s : f32 = 0.0;
+  for i in 0..480 {
+    s = s + x[384 + i] * x[384 + i - lag];
+  }
+  return s;
+}
+
+// RNNoise's remove_doubling: checks whether 1/k of the pitch period fits about
+// as well, for k from 2 to 15, so that a multiple of the period does not win.
+// Reads the last period and gain from the state, and writes the new ones.
+fn remove_doubling(x : &Tensor<f32, [864]>, t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+st : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>, pitch : i32) -> void {
+  let maxperiod : i32 = 384;
+  let minperiod : i32 = 30;
+  let prev_period = (st[0][S_LAST_PERIOD] as i32) / 2;
+  let prev_gain = st[0][S_LAST_GAIN];
+  let mut t0 = pitch / 2;
+  if t0 >= maxperiod {
+    t0 = maxperiod - 1;
+  }
+  let mut tt = t0;
+  let mut xx : f32 = 0.0;
+  let mut xy : f32 = 0.0;
+  for i in 0..480 {
+    xx = xx + x[384 + i] * x[384 + i];
+    xy = xy + x[384 + i] * x[384 + i - t0];
+  }
+  let mut yy_lookup = Tensor<f32, [385]>::fill(0.0);
+  yy_lookup[0] = xx;
+  let mut yy = xx;
+  for i in 1..maxperiod + 1 {
+    yy = yy + x[384 - i] * x[384 - i] - x[384 + 480 - i] * x[384 + 480 - i];
+    yy_lookup[i] = max32(0.0, yy);
+  }
+  yy = yy_lookup[t0];
+  let mut best_xy = xy;
+  let mut best_yy = yy;
+  let g0 = pitch_gain(xy, xx, yy);
+  let mut g = g0;
+  let mut k : i32 = 2;
+  while k <= 15 {
+    let t1 = (2 * t0 + k) / (2 * k);
+    if t1 < minperiod {
+      k = 16;
+    } else {
+      let mut t1b = t0 + t1;
+      if k == 2 {
+        if t1 + t0 > maxperiod {
+          t1b = t0;
+        }
+      } else {
+        t1b = (2 * (t[0][T_SECOND + k] as i32) * t0 + k) / (2 * k);
+      }
+      let mut xy1 : f32 = 0.0;
+      let mut xy2 : f32 = 0.0;
+      for i in 0..480 {
+        xy1 = xy1 + x[384 + i] * x[384 + i - t1];
+        xy2 = xy2 + x[384 + i] * x[384 + i - t1b];
+      }
+      let xyk = 0.5 * (xy1 + xy2);
+      let yyk = 0.5 * (yy_lookup[t1] + yy_lookup[t1b]);
+      let g1 = pitch_gain(xyk, xx, yyk);
+      let mut cont : f32 = 0.0;
+      if abs_i32(t1 - prev_period) <= 1 {
+        cont = prev_gain;
+      } else if abs_i32(t1 - prev_period) <= 2 && 5 * k * k < t0 {
+        cont = 0.5 * prev_gain;
+      }
+      let mut thresh = max32(0.3, 0.7 * g0 - cont);
+      if t1 < 3 * minperiod {
+        thresh = max32(0.4, 0.85 * g0 - cont);
+      } else if t1 < 2 * minperiod {
+        thresh = max32(0.5, 0.9 * g0 - cont);
+      }
+      if g1 > thresh {
+        best_xy = xyk;
+        best_yy = yyk;
+        tt = t1;
+        g = g1;
+      }
+      k = k + 1;
+    }
+  }
+  best_xy = max32(0.0, best_xy);
+  let mut pg : f32 = 1.0;
+  if best_yy > best_xy {
+    pg = best_xy / (best_yy + 1.0);
+  }
+  let c0 = inner(x, tt - 1);
+  let c1 = inner(x, tt);
+  let c2 = inner(x, tt + 1);
+  let mut offset : i32 = 0;
+  if c2 - c0 > 0.7 * (c1 - c0) {
+    offset = 1;
+  } else if c0 - c2 > 0.7 * (c1 - c2) {
+    offset = 0 - 1;
+  }
+  if pg > g {
+    pg = g;
+  }
+  let mut period = 2 * tt + offset;
+  if period < 2 * minperiod {
+    period = 2 * minperiod;
+  }
+  st[0][S_LAST_PERIOD] = period as f32;
+  st[0][S_LAST_GAIN] = pg;
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// The network (rnn.c of RNNoise). The weights are int8 values; each sum is
+// scaled by 1 / 256.
+//===----------------------------------------------------------------------===//
+
+// tanh from the table of RNNoise, with a correction of first order.
+fn tansig(w : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, v : f32) -> f32 {
+  if !(v < 8.0) {
+    return 1.0;
+  }
+  if !(v > 0.0 - 8.0) {
+    return 0.0 - 1.0;
+  }
+  let mut x = v;
+  let mut sign : f32 = 1.0;
+  if x < 0.0 {
+    x = 0.0 - x;
+    sign = 0.0 - 1.0;
+  }
+  let i = ((0.5 + 25.0 * x) as f64).floor() as i32;
+  x = x - 0.04 * (i as f32);
+  let mut y = w[0][W_TANH + i];
+  let dy = 1.0 - y * y;
+  y = y + x * dy * (1.0 - y * x);
+  return sign * y;
+}
+
+fn sigmoid(w : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, v : f32) -> f32 {
+  let h = (0.5 * (v as f64)) as f32;
+  return (0.5 + 0.5 * (tansig(w, h) as f64)) as f32;
+}
+
+// out = the activation of (bias + W in) / 256, for a dense layer with `n_in`
+// inputs and `n` units at `off`. act: 0 tanh, 1 sigmoid.
+fn dense(out : &mut Tensor<f32, [128]>, inp : &Tensor<f32, [128]>,
+w : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, off : i32, n_in : i32, n : i32, act : i32) -> void {
+  let scale : f32 = 1.0 / 256.0;
+  for i in 0..n {
+    let mut sum = w[0][off + n_in * n + i];
+    for j in 0..n_in {
+      sum = sum + w[0][off + j * n + i] * inp[j];
+    }
+    let v = scale * sum;
+    if act == 0 {
+      out[i] = tansig(w, v);
+    } else {
+      out[i] = sigmoid(w, v);
+    }
+  }
+  return;
+}
+
+// One step of a GRU with `n_in` inputs and `n` units at `off`, whose state is
+// st[at] to st[at + n - 1]. The candidate uses relu, as in RNNoise v0.1.1.
+fn gru(st : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>, at : i32, inp : &Tensor<f32, [128]>,
+w : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, off : i32, n_in : i32, n : i32) -> void {
+  let scale : f32 = 1.0 / 256.0;
+  let stride = 3 * n;
+  let rec = off + n_in * stride;
+  let bias = rec + n * stride;
+  let mut z = Tensor<f32, [128]>::fill(0.0);
+  let mut r = Tensor<f32, [128]>::fill(0.0);
+  let mut h = Tensor<f32, [128]>::fill(0.0);
+  for i in 0..n {
+    let mut sum = w[0][bias + i];
+    for j in 0..n_in {
+      sum = sum + w[0][off + j * stride + i] * inp[j];
+    }
+    for j in 0..n {
+      sum = sum + w[0][rec + j * stride + i] * st[0][at + j];
+    }
+    z[i] = sigmoid(w, scale * sum);
+  }
+  for i in 0..n {
+    let mut sum = w[0][bias + n + i];
+    for j in 0..n_in {
+      sum = sum + w[0][off + n + j * stride + i] * inp[j];
+    }
+    for j in 0..n {
+      sum = sum + w[0][rec + n + j * stride + i] * st[0][at + j];
+    }
+    r[i] = sigmoid(w, scale * sum);
+  }
+  for i in 0..n {
+    let mut sum = w[0][bias + 2 * n + i];
+    for j in 0..n_in {
+      sum = sum + w[0][off + 2 * n + j * stride + i] * inp[j];
+    }
+    for j in 0..n {
+      sum = sum + w[0][rec + 2 * n + j * stride + i] * st[0][at + j] * r[j];
+    }
+    let c = max32(0.0, scale * sum);
+    h[i] = z[i] * st[0][at + i] + (1.0 - z[i]) * c;
+  }
+  for i in 0..n {
+    st[0][at + i] = h[i];
+  }
+  return;
+}
+
+// The gains of the 22 bands, and the probability of a voice, from the features.
+fn compute_rnn(gains : &mut Tensor<f32, [22]>, features : &Tensor<f32, [128]>,
+st : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>, w : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> f32 {
+  let mut dense_out = Tensor<f32, [128]>::fill(0.0);
+  dense(&mut dense_out, features, w, W_INPUT_DENSE, 42, 24, 0);
+  gru(st, S_VAD, &dense_out, w, W_VAD_GRU, 24, 24);
+  let mut v = Tensor<f32, [128]>::fill(0.0);
+  for i in 0..24 {
+    v[i] = st[0][S_VAD + i];
+  }
+  let mut vad = Tensor<f32, [128]>::fill(0.0);
+  dense(&mut vad, &v, w, W_VAD_OUTPUT, 24, 1, 1);
+  let mut noise_in = Tensor<f32, [128]>::fill(0.0);
+  for i in 0..24 {
+    noise_in[i] = dense_out[i];
+    noise_in[24 + i] = st[0][S_VAD + i];
+  }
+  for i in 0..42 {
+    noise_in[48 + i] = features[i];
+  }
+  gru(st, S_NOISE, &noise_in, w, W_NOISE_GRU, 90, 48);
+  let mut denoise_in = Tensor<f32, [128]>::fill(0.0);
+  for i in 0..24 {
+    denoise_in[i] = st[0][S_VAD + i];
+  }
+  for i in 0..48 {
+    denoise_in[24 + i] = st[0][S_NOISE + i];
+  }
+  for i in 0..42 {
+    denoise_in[72 + i] = features[i];
+  }
+  gru(st, S_DENOISE, &denoise_in, w, W_DENOISE_GRU, 114, 96);
+  let mut d = Tensor<f32, [128]>::fill(0.0);
+  for i in 0..96 {
+    d[i] = st[0][S_DENOISE + i];
+  }
+  let mut g = Tensor<f32, [128]>::fill(0.0);
+  dense(&mut g, &d, w, W_DENOISE_OUTPUT, 96, 22, 1);
+  for i in 0..BANDS {
+    gains[i] = g[i];
+  }
+  return vad[0];
+}
+
+//===----------------------------------------------------------------------===//
+// One frame (denoise.c of RNNoise).
+//===----------------------------------------------------------------------===//
+
+// The 42 features of the frame, and its spectrum X and band energies Ex. Also
+// the spectrum P of the signal one pitch period back, its band energies Ep, and
+// the correlation Exp of X and P. Returns 1 for a frame without sound.
+fn frame_features(features : &mut Tensor<f32, [128]>, xr : &mut Tensor<f32, [960]>,
+xi : &mut Tensor<f32, [960]>, pr : &mut Tensor<f32, [960]>, pi : &mut Tensor<f32, [960]>,
+ex : &mut Tensor<f32, [22]>, ep : &mut Tensor<f32, [22]>, exp : &mut Tensor<f32, [22]>,
+inp : &Tensor<f32, [960]>, st : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> i32 {
+  // The analysis window: the last frame, then this one.
+  let mut x = Tensor<f32, [960]>::fill(0.0);
+  for i in 0..FRAME {
+    x[i] = st[0][S_ANALYSIS + i];
+    x[FRAME + i] = inp[i];
+    st[0][S_ANALYSIS + i] = inp[i];
+  }
+  apply_window(&mut x, t);
+  forward_transform(xr, xi, &x, t);
+  band_energy(ex, xr, xi, t);
+
+  // The pitch.
+  for i in 0..1728 - FRAME {
+    st[0][S_PITCH + i] = st[0][S_PITCH + FRAME + i];
+  }
+  for i in 0..FRAME {
+    st[0][S_PITCH + 1728 - FRAME + i] = inp[i];
+  }
+  let mut lp = Tensor<f32, [864]>::fill(0.0);
+  pitch_downsample(&mut lp, st);
+  let found = 768 - pitch_search(&lp);
+  remove_doubling(&lp, t, st, found);
+  let pitch_index = st[0][S_LAST_PERIOD] as i32;
+  let mut p = Tensor<f32, [960]>::fill(0.0);
+  for i in 0..WINDOW {
+    p[i] = st[0][S_PITCH + 1728 - WINDOW - pitch_index + i];
+  }
+  apply_window(&mut p, t);
+  forward_transform(pr, pi, &p, t);
+  band_energy(ep, pr, pi, t);
+  band_corr(exp, xr, xi, pr, pi, t);
+  for i in 0..BANDS {
+    let d = 0.001 + ((ex[i] * ep[i]) as f64);
+    exp[i] = ((exp[i] as f64) / d.sqrt()) as f32;
+  }
+  let mut tmp = Tensor<f32, [22]>::fill(0.0);
+  dct(&mut tmp, exp, t);
+  for i in 0..6 {
+    features[34 + i] = tmp[i];
+  }
+  features[34] = ((features[34] as f64) - 1.3) as f32;
+  features[35] = ((features[35] as f64) - 0.9) as f32;
+  features[40] = (0.01 * ((pitch_index - 300) as f64)) as f32;
+
+  // The log energy of each band, with a floor that follows the bands before.
+  let mut ly = Tensor<f32, [22]>::fill(0.0);
+  let mut log_max : f32 = 0.0 - 2.0;
+  let mut follow : f32 = 0.0 - 2.0;
+  let mut e : f32 = 0.0;
+  for i in 0..BANDS {
+    let l = (0.01 + (ex[i] as f64)).log10() as f32;
+    let inner = max64((follow as f64) - 1.5, l as f64);
+    ly[i] = max64((log_max - 7.0) as f64, inner) as f32;
+    log_max = max32(log_max, ly[i]);
+    follow = max64((follow as f64) - 1.5, ly[i] as f64) as f32;
+    e = e + ex[i];
+  }
+  if (e as f64) < 0.04 {
+    for i in 0..42 {
+      features[i] = 0.0;
+    }
+    return 1;
+  }
+  let mut ceps = Tensor<f32, [22]>::fill(0.0);
+  dct(&mut ceps, &ly, t);
+  for i in 0..BANDS {
+    features[i] = ceps[i];
+  }
+  features[0] = features[0] - 12.0;
+  features[1] = features[1] - 4.0;
+
+  // The cepstrum of this frame and the two before it.
+  let memid = st[0][S_MEMID] as i32;
+  let c0 = S_CEPS + memid * BANDS;
+  let mut c1 = S_CEPS + (memid - 1) * BANDS;
+  if memid < 1 {
+    c1 = S_CEPS + (8 + memid - 1) * BANDS;
+  }
+  let mut c2 = S_CEPS + (memid - 2) * BANDS;
+  if memid < 2 {
+    c2 = S_CEPS + (8 + memid - 2) * BANDS;
+  }
+  for i in 0..BANDS {
+    st[0][c0 + i] = features[i];
+  }
+  for i in 0..6 {
+    features[i] = st[0][c0 + i] + st[0][c1 + i] + st[0][c2 + i];
+    features[BANDS + i] = st[0][c0 + i] - st[0][c2 + i];
+    features[BANDS + 6 + i] = st[0][c0 + i] - 2.0 * st[0][c1 + i] + st[0][c2 + i];
+  }
+  let mut next = memid + 1;
+  if next == 8 {
+    next = 0;
+  }
+  st[0][S_MEMID] = next as f32;
+
+  // How much the spectrum changes: for each of the last 8 frames, the distance
+  // to the nearest other one.
+  let mut variability : f32 = 0.0;
+  for i in 0..8 {
+    let mut mindist : f32 = 1000000000000000.0;
+    for j in 0..8 {
+      let mut dist : f32 = 0.0;
+      for k in 0..BANDS {
+        let d = st[0][S_CEPS + i * BANDS + k] - st[0][S_CEPS + j * BANDS + k];
+        dist = dist + d * d;
+      }
+      if j != i && dist < mindist {
+        mindist = dist;
+      }
+    }
+    variability = variability + mindist;
+  }
+  features[41] = (((variability / 8.0) as f64) - 2.1) as f32;
+  return 0;
+}
+
+// Adds the signal one pitch period back to X, in each band as much as the
+// pitch correlation Exp says there is a voice, then keeps the energy of X.
+fn pitch_filter(xr : &mut Tensor<f32, [960]>, xi : &mut Tensor<f32, [960]>,
+pr : &Tensor<f32, [960]>, pi : &Tensor<f32, [960]>, ex : &Tensor<f32, [22]>,
+ep : &Tensor<f32, [22]>, exp : &Tensor<f32, [22]>, g : &Tensor<f32, [22]>,
+t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  let mut r = Tensor<f32, [22]>::fill(0.0);
+  for i in 0..BANDS {
+    let mut ri : f32 = 1.0;
+    if !(exp[i] > g[i]) {
+      let num = exp[i] * exp[i] * (1.0 - g[i] * g[i]);
+      let den = 0.001 + ((g[i] * g[i] * (1.0 - exp[i] * exp[i])) as f64);
+      ri = ((num as f64) / den) as f32;
+    }
+    ri = (min32(1.0, max32(0.0, ri)) as f64).sqrt() as f32;
+    let scale = ((ex[i] as f64) / (0.00000001 + (ep[i] as f64))).sqrt();
+    r[i] = ((ri as f64) * scale) as f32;
+  }
+  let mut rf = Tensor<f32, [960]>::fill(0.0);
+  interp_band_gain(&mut rf, &r, t);
+  for i in 0..FREQ {
+    xr[i] = xr[i] + rf[i] * pr[i];
+    xi[i] = xi[i] + rf[i] * pi[i];
+  }
+  let mut new_e = Tensor<f32, [22]>::fill(0.0);
+  band_energy(&mut new_e, xr, xi, t);
+  let mut norm = Tensor<f32, [22]>::fill(0.0);
+  for i in 0..BANDS {
+    norm[i] = ((ex[i] as f64) / (0.00000001 + (new_e[i] as f64))).sqrt() as f32;
+  }
+  let mut normf = Tensor<f32, [960]>::fill(0.0);
+  interp_band_gain(&mut normf, &norm, t);
+  for i in 0..FREQ {
+    xr[i] = xr[i] * normf[i];
+    xi[i] = xi[i] * normf[i];
+  }
+  return;
+}
+
+// One frame of 480 samples from `inp` to `out`. With `enabled` 0, the network
+// still runs, so that its state is ready, but the frame gets no gains: the
+// output is the input, with the same delay. stats: the probability of a voice,
+// the pitch period, and 1 for a frame without sound.
+fn denoise_frame(out : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+inp : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, st : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+w : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, t : &Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+stats : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>, enabled : i32) -> void {
+  assert(inp.extent(1) == FRAME && out.extent(1) == FRAME, "a frame holds 480 samples");
+  assert(st.extent(1) == STATE_SIZE, "the state of the noise removal holds 3059 floats");
+  assert(w.extent(1) == WEIGHTS_SIZE, "models/rnnoise.f32 holds 87704 floats");
+  assert(t.extent(1) == TABLES_SIZE, "the tables of the noise removal hold 2922 floats");
+  assert(stats.extent(1) == 3, "the stats of a frame are 3 floats");
+  // The high-pass filter: a biquad with the float coefficients of RNNoise.
+  let b0 = ((0.0 - 2.0) as f32) as f64;
+  let b1 = (1.0 as f32) as f64;
+  let a0 = ((0.0 - 1.99599) as f32) as f64;
+  let a1 = (0.99600 as f32) as f64;
+  let mut x = Tensor<f32, [960]>::fill(0.0);
+  for i in 0..FRAME {
+    let xi = inp[0][i];
+    let yi = xi + st[0][S_HP];
+    st[0][S_HP] = ((st[0][S_HP + 1] as f64) + (b0 * (xi as f64) - a0 * (yi as f64))) as f32;
+    st[0][S_HP + 1] = (b1 * (xi as f64) - a1 * (yi as f64)) as f32;
+    x[i] = yi;
+  }
+  let mut features = Tensor<f32, [128]>::fill(0.0);
+  let mut xr = Tensor<f32, [960]>::fill(0.0);
+  let mut xi = Tensor<f32, [960]>::fill(0.0);
+  let mut pr = Tensor<f32, [960]>::fill(0.0);
+  let mut pi = Tensor<f32, [960]>::fill(0.0);
+  let mut ex = Tensor<f32, [22]>::fill(0.0);
+  let mut ep = Tensor<f32, [22]>::fill(0.0);
+  let mut exp = Tensor<f32, [22]>::fill(0.0);
+  let silence = frame_features(&mut features, &mut xr, &mut xi, &mut pr, &mut pi, &mut ex, &mut ep,
+  &mut exp, &x, st, t);
+  let mut vad : f32 = 0.0;
+  if silence == 0 {
+    let mut g = Tensor<f32, [22]>::fill(0.0);
+    vad = compute_rnn(&mut g, &features, st, w);
+    if enabled == 1 {
+      pitch_filter(&mut xr, &mut xi, &pr, &pi, &ex, &ep, &exp, &g, t);
+    }
+    for i in 0..BANDS {
+      g[i] = max32(g[i], 0.6 * st[0][S_LASTG + i]);
+      st[0][S_LASTG + i] = g[i];
+    }
+    if enabled == 1 {
+      let mut gf = Tensor<f32, [960]>::fill(0.0);
+      interp_band_gain(&mut gf, &g, t);
+      for i in 0..FREQ {
+        xr[i] = xr[i] * gf[i];
+        xi[i] = xi[i] * gf[i];
+      }
+    }
+  }
+  // Synthesis: the inverse FFT, the window, and the overlap with the last one.
+  let mut y = Tensor<f32, [960]>::fill(0.0);
+  inverse_transform(&mut y, &xr, &xi, t);
+  apply_window(&mut y, t);
+  for i in 0..FRAME {
+    out[0][i] = y[i] + st[0][S_SYNTH + i];
+    st[0][S_SYNTH + i] = y[FRAME + i];
+  }
+  stats[0][0] = vad;
+  stats[0][1] = st[0][S_LAST_PERIOD];
+  stats[0][2] = silence as f32;
+  return;
+}

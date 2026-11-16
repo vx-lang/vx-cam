@@ -147,11 +147,20 @@ final class Pipeline {
   /// two frames at once (runAlternating). nil for the stand-in.
   private let model: (weights: Shared<Float>, arenas: [Shared<Float>])?
   var hasModel: Bool { model != nil }
+  /// With VXCAM_MODEL=tiles, the model's 1 x 1 convolutions use matmuls of tiles. That is faster
+  /// on the GPU, but the CPU and the GPU then differ in the last bits of the mask.
+  let modelTiles = ProcessInfo.processInfo.environment["VXCAM_MODEL"] == "tiles"
 
   /// `gpu` names the stages that start on the GPU: "all", or names separated by commas.
   init(w: Int, h: Int, gpu: String = ProcessInfo.processInfo.environment["VXCAM_GPU"] ?? "") {
     self.w = w
     self.h = h
+    // fatalError, not precondition: an -O build prints the message of fatalError only.
+    if let m = ProcessInfo.processInfo.environment["VXCAM_MODEL"],
+      !["", "loops", "tiles"].contains(m)
+    {
+      fatalError("VXCAM_MODEL is \"\(m)\": use loops (the default) or tiles")
+    }
     let n = (w / 4) * (h / 4)
     out = Shared(count: w * h * 4)
     smalls = (0..<Pipeline.slots).map { _ in Shared(count: n * 3) }
@@ -209,7 +218,8 @@ final class Pipeline {
     vx_metal_set_enabled(onGPU ? 1 : 0)
     if let model {
       vxcam_model_frame(
-        masks[s].ptr, smalls[s].ptr, model.weights.ptr, model.arenas[a].ptr, Int64(sw), Int64(sh))
+        masks[s].ptr, smalls[s].ptr, model.weights.ptr, model.arenas[a].ptr, Int64(sw), Int64(sh),
+        modelTiles ? 1 : 0)
     } else {
       vxcam_segment_image(
         masks[s].ptr, background.ptr, smalls[s].ptr, Int64(sw), Int64(sh), Int64(frameIndex))

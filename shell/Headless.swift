@@ -25,7 +25,9 @@ func hashOutput(_ p: Pipeline, into digest: inout UInt64) {
 /// VXCAM_ALTERNATE=1 runs the model on the GPU and the CPU for alternate frames (runAlternating);
 /// VXCAM_COMPARE_EVERY=K compares the devices every K frames (0: never; unset: the last frame);
 /// VXCAM_HASH=1 prints a hash of every output frame; VXCAM_VIEW=mask or noblur and
-/// VXCAM_OUTLINE=1 pick what the output shows; VXCAM_SCHEDULE moves stages (Scheduler).
+/// VXCAM_OUTLINE=1 pick what the output shows; VXCAM_SCHEDULE moves stages (Scheduler);
+/// VXCAM_AUDIO=file cleans the audio of the file on another thread while the video runs
+/// (BackgroundAudio), and VXCAM_DENOISE=off runs that audio through without the gains.
 func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   guard let first = source.next() else { fatalError("the clip has no frames") }
   let p = Pipeline(w: CVPixelBufferGetWidth(first), h: CVPixelBufferGetHeight(first))
@@ -59,6 +61,7 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   var threads: [Double]?
   var model: [[Double]] = [[], []]  // preprocess and segment, on the GPU and on the CPU
   var wallStart = 0.0
+  let audio = BackgroundAudio()
   for i in 0..<(overlap || alternate ? warmup : frames) {
     if i == warmup { wallStart = nowMs() }
     guard let pb = i == 0 ? first : source.next() else { break }
@@ -94,6 +97,7 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
   } else {
     wall = nowMs() - wallStart
   }
+  audio?.stop()
   // The overlay shows moving averages, which mostly reflect the last frames. The GPU changes its
   // clock during a run, so a run reports the median of each column, and the spread of the frame.
   let n = log.count
@@ -139,6 +143,14 @@ func runHeadless(source: VideoSource, frames: Int, dir: String?) {
           + "the GPU model thread is busy %.0f%% of the time, the CPU one %.0f%%, the last stages %.0f%%",
         mid(model[0]), mid(model[1]), 100 * threads[0] / wall, 100 * threads[1] / wall,
         100 * threads[2] / wall))
+  }
+  if let audio {
+    print(
+      String(
+        format:
+          "audio: %d frames of 10 ms on another thread while the video ran, noise removal %@; "
+          + "a frame took %.3f ms (median)", audio.frames, audio.denoiser.enabled ? "on" : "off",
+        audio.denoiser.medianMs))
   }
   if let s = p.scheduler {
     print(s.summary)

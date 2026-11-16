@@ -17,9 +17,9 @@ LIBS = $(DISPATCH) $(VX)/target/debug/libvx_std_core.a -lffi -lc++ \
 # folder (*.mov) stay out of git.
 CLIP ?= build/test_clip.mov
 
-.PHONY: all run video demo compare camera check bench format clean
+.PHONY: all run video demo compare camera check bench denoise check-denoise noise-demo format clean
 
-all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32
+all: build/vx-cam build/test_clip.mov build/selfie_segmentation_landscape.f32 build/rnnoise.f32
 
 # vxcam.vx imports the other modules in pipeline/. vxcam.o depends on vxc and the runtime too: an
 # object from an older vxc may not match a newer runtime (since vx-lang/Vx#2781, a pub fn waits
@@ -39,6 +39,10 @@ build/vx-cam: $(SHELL_SOURCES) shell/Info.plist pipeline/vxcam.h build/vxcam.o $
 
 # The segmentation model's weights go next to the binary (models/README.md).
 build/selfie_segmentation_landscape.f32: models/selfie_segmentation_landscape.f32 | build
+	cp $< $@
+
+# So do the weights of the noise removal.
+build/rnnoise.f32: models/rnnoise.f32 | build
 	cp $< $@
 
 build/make_test_clip: tools/make_test_clip.swift | build
@@ -123,6 +127,62 @@ format:
 	$(VX)/target/debug/vx-format pipeline/*.vx
 	xcrun swift-format format -i shell/*.swift tools/*.swift
 	xcrun swift-format lint shell/*.swift tools/*.swift
+
+# The test audio of the noise removal: speech from `say`, with real typing on a keyboard and a
+# little fan noise (tools/make_noisy_speech.swift). It also writes build/noisy_speech.f32 and
+# build/noisy_speech_speech.f32 (the speech alone) for make check-denoise. The typing is from
+# Keyboard Soundpack #1 by unicaegames (CC0), a Cherry KC
+# 1000 recorded with a Shure SM7B:
+# https://opengameart.org/content/keyboard-soundpack-1-typing-and-single-keystrokes
+KEYS_ZIP = https://opengameart.org/sites/default/files/unicae_games_keyboard_soundpack_1_0.zip
+KEYS_SHA256 = 935eae2fa5c3742eacdd38c4ea0e9047f3887faa0701996498492c256db1b351
+TYPING = $(foreach i,001 002 003,build/keys/Human\ Typing/human_vel-$(i).wav)
+build/keys/readme.txt: | build
+	curl -sSL -o build/keys.zip $(KEYS_ZIP)
+	echo "$(KEYS_SHA256)  build/keys.zip" | shasum -a 256 -c -
+	unzip -o -q build/keys.zip -d build/keys
+	touch $@
+
+build/speech.aiff: | build
+	say -o $@ "Hello. This is a test of the noise removal in vx-cam. While I talk, someone \
+	  types on a loud keyboard next to the microphone. The noise removal runs on the CPU, in Vx, \
+	  ten milliseconds at a time, while the GPU runs the video. Press the n key to turn it on \
+	  and off, and listen to the clicks of the keyboard."
+
+build/make_noisy_speech: tools/make_noisy_speech.swift | build
+	swiftc -O -suppress-warnings $< -o $@
+
+build/noisy_speech.wav: build/make_noisy_speech build/speech.aiff build/keys/readme.txt
+	./build/make_noisy_speech build/speech.aiff build/noisy_speech $(TYPING)
+
+# Removes the noise from AUDIO (a sound file or a movie, the test audio by default) and writes
+# build/clean_speech.wav.
+AUDIO ?= build/noisy_speech.wav
+denoise: all build/noisy_speech.wav
+	./build/vx-cam --denoise $(AUDIO) build/clean_speech.wav
+
+# Compares the noise removal with the C code of RNNoise v0.1.1, which it ports, on the test
+# audio (tools/check_denoise.py). RNNOISE is a checkout of https://github.com/xiph/rnnoise at the
+# tag v0.1.1. The C code is built without fused multiply-adds, as Vx computes.
+RNNOISE ?=
+RNNOISE_C = denoise.c rnn.c rnn_data.c pitch.c kiss_fft.c celt_lpc.c
+build/rnnoise_reference: tools/rnnoise_reference.c | build
+	@test -n "$(RNNOISE)" || { echo "$@ needs RNNOISE=<a checkout of RNNoise at v0.1.1>"; exit 1; }
+	cc -O2 -ffp-contract=off -I$(RNNOISE)/include -I$(RNNOISE)/src $< \
+	  $(addprefix $(RNNOISE)/src/,$(RNNOISE_C)) -lm -o $@
+
+check-denoise: all build/noisy_speech.wav build/rnnoise_reference
+	./build/rnnoise_reference build/noisy_speech.f32 build/clean_c.f32
+	./build/vx-cam --denoise build/noisy_speech.f32 build/clean_vx.f32
+	$(BENCH_PYTHON) tools/check_denoise.py build/noisy_speech.f32 build/noisy_speech_speech.f32 \
+	  build/clean_c.f32 build/clean_vx.f32
+
+# Writes build/noise.mov: the test clip with the test audio, 24 seconds, where the noise removal
+# turns on and off every 4 seconds. The panel says when it is on. The video runs on the GPU, so
+# the CPU is free for the sound. The bitrate keeps the movie under 10 MB, as for make demo.
+noise-demo: all build/noisy_speech.wav
+	VXCAM_GPU=all VXCAM_AUDIO=build/noisy_speech.wav VXCAM_DENOISE=every:4 VXCAM_BITRATE=2500000 \
+	  ./build/vx-cam $(CLIP) --write build/noise.mov outline panel 720
 
 build:
 	mkdir -p build
