@@ -8,5 +8,7 @@
   <string>vx-cam</string>
   <key>NSCameraUsageDescription</key>
   <string>vx-cam blurs the background of the camera image and frames the person in it.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>vx-cam removes the background noise from the sound of the microphone.</string>
 </dict>
 </plist>

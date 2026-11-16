@@ -21,6 +21,8 @@ final class App: NSObject, NSApplicationDelegate {
   var paused = false
   var showOverlay = true
   var note = ""
+  /// The microphone, cleaned by the noise removal, with the camera.
+  var audio: LiveAudio?
 
   init(source: FrameSource) { self.source = source }
 
@@ -42,12 +44,16 @@ final class App: NSObject, NSApplicationDelegate {
     view.onKey = { [weak self] k in self?.key(k) }
     window.contentView = view
     window.title =
-      "vx-cam  ·  keys: m mask  e outline  b blur  f framing  1-5 device  a scheduler  r relearn  o overlay  space pause  q quit"
+      "vx-cam  ·  keys: m mask  e outline  b blur  f framing  1-5 device  a scheduler  r relearn  n noise removal  p play  o overlay  space pause  q quit"
     window.center()
     window.makeKeyAndOrderFront(nil)
     window.makeFirstResponder(view)
     NSApp.activate(ignoringOtherApps: true)
 
+    if source is CameraSource, let d = Denoiser() {
+      audio = LiveAudio(d)
+      audio?.start()
+    }
     source.start(on: queue) { [weak self] pb in self?.show(pb) }
   }
 
@@ -57,7 +63,12 @@ final class App: NSObject, NSApplicationDelegate {
     if pipeline == nil || pipeline.w != w || pipeline.h != h { pipeline = Pipeline(w: w, h: h) }
     pipeline.process(pb)
     let img = pipeline.image()
-    let text = pipeline.table(fps: source.fps, note: note)
+    var text = pipeline.table(fps: source.fps, note: note)
+    if let a = audio {
+      text +=
+        "\n" + audioLine(a.stream.denoiser)
+        + (a.playing ? ", playing" : ", not playing (p plays it; use headphones)")
+    }
     DispatchQueue.main.async {
       CATransaction.begin()
       CATransaction.setDisableActions(true)
@@ -79,6 +90,8 @@ final class App: NSObject, NSApplicationDelegate {
       case "r":  // learn the background again from the next frame
         p.frameIndex = 0
         note = "learning the background from this frame"
+      case "n": audio?.stream.denoiser.enabled.toggle()
+      case "p": audio?.playing.toggle()
       case "o": showOverlay.toggle()
       case " ": paused.toggle()
       case "q": DispatchQueue.main.async { NSApp.terminate(nil) }

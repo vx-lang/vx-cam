@@ -24,6 +24,7 @@
 import core::convert;
 import core::num;
 import common;
+import denoise;
 import model;
 
 //===----------------------------------------------------------------------===//
@@ -67,6 +68,31 @@ pub fn vxcam_preprocess(small : &mut Tensor<f32, [?, ?], Memory::HBM>,
 frame : &Tensor<u8, [?, ?], Memory::HBM>, sw : i32, sh : i32, scale : i32) -> void {
   let inv : f32 = 1.0 / ((scale * scale) as f32 * 255.0);
   preprocess_kernel(small, frame, sw, sh, scale, inv);
+  return;
+}
+
+//===----------------------------------------------------------------------===//
+// Audio: noise removal for the microphone (denoise.vx). Host code: the work of
+// one frame of 10 ms is small, and each frame needs the state of the one before,
+// so it runs on the CPU while the GPU runs the video.
+//===----------------------------------------------------------------------===//
+
+// The tables of the noise removal: [1, 2922], once.
+pub fn vxcam_denoise_init(tables : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>) -> void {
+  denoise_tables(tables);
+  return;
+}
+
+// One frame from `inp` to `out`: 480 samples at 48 kHz, with the values of
+// 16-bit audio. `out` is 10 ms behind `inp`. `state` is [1, 3059] and starts as
+// zeros. `weights` holds models/rnnoise.f32. `stats` gets the probability of a
+// voice, the pitch period, and 1 for a frame without sound. With `enabled` 0,
+// the output is the input, 10 ms later.
+pub fn vxcam_denoise(out : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+inp : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, state : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+weights : &Tensor<f32, [?, ?], Memory::CPU_DRAM>, tables : &Tensor<f32, [?, ?], Memory::CPU_DRAM>,
+stats : &mut Tensor<f32, [?, ?], Memory::CPU_DRAM>, enabled : i32) -> void {
+  denoise_frame(out, inp, state, weights, tables, stats, enabled);
   return;
 }
 

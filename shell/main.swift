@@ -9,11 +9,15 @@
 //   Headless.swift   --headless: stage tables, output hashes, device checks
 //   Movie.swift      --write: a movie of the output, with the stage panel
 //   Compare.swift    --compare: a movie of the model moving between devices, in Core ML and Vx
+//   Audio.swift      noise removal for the microphone, in Vx on the CPU
 //   Window.swift     the window, its overlay and keys
 //
 // Usage:
 //   vx-cam <clip.mov>                      play the clip in a window
-//   vx-cam --camera                        run on the default camera in a window
+//   vx-cam --camera                        run on the default camera and microphone in a window
+//   vx-cam --denoise in out                remove the noise from the audio of `in` (a sound
+//                                          file or a movie) and write it to `out` (.wav, or
+//                                          raw .f32 for tools/check_denoise.py)
 //   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table (medians),
 //                                          and write a few frames as PNG to dir
 //   vx-cam <clip.mov> --write out.mov [mask] [outline] [panel] [N]
@@ -29,9 +33,13 @@ import AppKit
 let args = CommandLine.arguments
 guard args.count >= 2 else {
   print(
-    "usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel] [N] | --compare out.mov [N]]  |  vx-cam --camera"
+    "usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel] [N] | --compare out.mov [N]]  |  vx-cam --camera  |  vx-cam --denoise in out"
   )
   exit(2)
+}
+if args.count == 4 && args[1] == "--denoise" {
+  runDenoise(from: args[2], to: args[3])
+  exit(0)
 }
 let source: FrameSource
 if args[1] == "--camera" {

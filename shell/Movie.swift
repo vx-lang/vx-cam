@@ -2,15 +2,18 @@
 import AVFoundation
 import AppKit
 
-/// An H.264 movie of BGRA frames, at VXCAM_BITRATE bits a second (8,000,000 by default).
+/// An H.264 movie of BGRA frames, at VXCAM_BITRATE bits a second (8,000,000 by default). With
+/// `audio`, it also has a track of 48 kHz mono AAC.
 final class MovieWriter {
   private let path: String
   private let writer: AVAssetWriter
   private let input: AVAssetWriterInput
   private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+  private var audioInput: AVAssetWriterInput?
   private(set) var frames = 0
+  private var audioSamples = 0
 
-  init(path: String, w: Int, h: Int, start: CMTime) {
+  init(path: String, w: Int, h: Int, start: CMTime, audio: Bool = false) {
     self.path = path
     let url = URL(fileURLWithPath: path)
     try? FileManager.default.removeItem(at: url)
@@ -32,6 +35,16 @@ final class MovieWriter {
         kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
       ])
     writer.add(input)
+    if audio {
+      let a = AVAssetWriterInput(
+        mediaType: .audio,
+        outputSettings: [
+          AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: Denoiser.rate,
+          AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 96_000,
+        ])
+      writer.add(a)
+      audioInput = a
+    }
     writer.startWriting()
     writer.startSession(atSourceTime: start)
     self.writer = writer
@@ -48,8 +61,42 @@ final class MovieWriter {
     frames += 1
   }
 
+  /// Adds 48 kHz mono samples from -1 to 1, after the samples before them.
+  func appendAudio(_ samples: [Float]) {
+    guard let audioInput, !samples.isEmpty else { return }
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: Denoiser.rate, mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4,
+      mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32,
+      mReserved: 0)
+    var format: CMAudioFormatDescription?
+    CMAudioFormatDescriptionCreate(
+      allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0,
+      magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
+    let bytes = samples.count * 4
+    var block: CMBlockBuffer?
+    CMBlockBufferCreateWithMemoryBlock(
+      allocator: nil, memoryBlock: nil, blockLength: bytes, blockAllocator: nil,
+      customBlockSource: nil, offsetToData: 0, dataLength: bytes, flags: 0, blockBufferOut: &block)
+    guard let format, let block else { fatalError("no buffer for the audio of \(path)") }
+    samples.withUnsafeBytes {
+      _ = CMBlockBufferReplaceDataBytes(
+        with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: bytes)
+    }
+    var sample: CMSampleBuffer?
+    CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+      allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: samples.count,
+      presentationTimeStamp: CMTime(value: CMTimeValue(audioSamples), timescale: 48_000),
+      packetDescriptions: nil, sampleBufferOut: &sample)
+    guard let sample else { fatalError("no audio sample for \(path)") }
+    while !audioInput.isReadyForMoreMediaData { usleep(1000) }
+    audioInput.append(sample)
+    audioSamples += samples.count
+  }
+
   func finish() {
     input.markAsFinished()
+    audioInput?.markAsFinished()
     let done = DispatchSemaphore(value: 0)
     writer.finishWriting { done.signal() }
     done.wait()
@@ -91,7 +138,8 @@ func bitmapContext(_ pb: CVPixelBuffer) -> CGContext? {
 /// view), "outline" and "panel" (drawPanel). Without `frames`, it runs every frame of the clip
 /// once, at the clip's times. With `frames`, it runs that many frames and plays the clip again
 /// from the start when it ends. VXCAM_OVERLAP=1 and VXCAM_ALTERNATE=1 run the frames as in
-/// runHeadless.
+/// runHeadless. With VXCAM_AUDIO, the movie gets the audio of that file, cleaned by the noise
+/// removal when VXCAM_DENOISE says so (DenoiseSchedule), and the panel shows the noise removal.
 func runWrite(source: VideoSource, to path: String, options: Set<String>, frames: Int? = nil) {
   source.loops = frames != nil
   guard let first = source.next() else { fatalError("the clip has no frames") }
@@ -101,7 +149,12 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>, frames
   p.outline = options.contains("outline")
   let total = frames ?? Int.max
   precondition(total > 0, "--write needs a number of frames above 0")
-  let movie = MovieWriter(path: path, w: w, h: h, start: frames == nil ? source.time : .zero)
+  let audio = MovieAudio(fps: source.fps)
+  if audio != nil && frames == nil {
+    fatalError("VXCAM_AUDIO needs --write with a number of frames")
+  }
+  let movie = MovieWriter(
+    path: path, w: w, h: h, start: frames == nil ? source.time : .zero, audio: audio != nil)
   // The clip's times start again when it loops, so a frame count gives frame k the time k / fps.
   func emit(_ clipTime: CMTime) {
     let time =
@@ -113,8 +166,11 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>, frames
       let rowBytes = CVPixelBufferGetBytesPerRow(frame)
       for y in 0..<h { memcpy(dst + y * rowBytes, p.out.ptr + y * w * 4, w * 4) }
       CVPixelBufferUnlockBaseAddress(frame, [])
-      if options.contains("panel") { drawPanel(on: frame, p, fps: source.fps) }
+      if options.contains("panel") {
+        drawPanel(on: frame, p, fps: source.fps, audio: audio.map { audioLine($0.stream.denoiser) })
+      }
     }
+    if let audio { movie.appendAudio(audio.until(time.seconds + 1 / source.fps)) }
   }
   p.process(first)
   emit(source.time)
@@ -146,8 +202,9 @@ func runWrite(source: VideoSource, to path: String, options: Set<String>, frames
 }
 
 /// Draws on a BGRA frame where each stage runs and how long it takes (moving averages), and
-/// the frame as a strip of CPU and GPU time against the budget.
-func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
+/// the frame as a strip of CPU and GPU time against the budget. `audio` is a line about the
+/// noise removal.
+func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double, audio: String? = nil) {
   CVPixelBufferLockBaseAddress(pb, [])
   defer { CVPixelBufferUnlockBaseAddress(pb, []) }
   guard let ctx = bitmapContext(pb) else { return }
@@ -192,7 +249,8 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   let row = 27.0
   let strip = 440.0
   let top = Double(p.h) - 20
-  let tall = row * (8.6 + Double(lanes.count) + (p.scheduler == nil ? 0 : 2))
+  let tall =
+    row * (8.6 + Double(lanes.count) + (p.scheduler == nil ? 0 : 2) + (audio == nil ? 0 : 1))
   box(
     CGRect(x: x0 - 14, y: top - tall, width: strip + 28, height: tall),
     CGColor(gray: 0, alpha: 0.62), radius: 10)
@@ -267,6 +325,10 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
       : lanes.count == 1
         ? "CPU and GPU share memory: 0 bytes copied"
         : "CPU and GPU at the same time, 0 bytes copied", x0, y, dim, size: 14)
+  if let audio {
+    y -= row
+    text(audio, x0, y, white, size: 14)
+  }
   // The scheduler: its moves, and what its checks of the two devices found.
   if let s = p.scheduler {
     y -= row
@@ -281,4 +343,11 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
       x0, y,
       s.differ == 0 ? white : CGColor(red: 1, green: 0.3, blue: 0.3, alpha: 1), size: 14)
   }
+}
+
+/// A line about the noise removal for the panel and the overlay.
+func audioLine(_ d: Denoiser) -> String {
+  String(
+    format: "noise removal %@: Vx on the CPU, %.2f ms a frame of 10 ms", d.enabled ? "on" : "off",
+    d.medianMs)
 }

@@ -27,3 +27,33 @@ That is 55 layers and 106401 floats. Nothing else changed.
 
 `tools/check_model.py` compares vx-cam's mask with TFLite's on the frames that
 `vx-cam --headless` writes out.
+
+# The noise removal model
+
+`rnnoise.f32` holds the weights of RNNoise v0.1.1 by Jean-Marc Valin (Mozilla and the Xiph.Org
+Foundation, 2017), and its table of tanh. RNNoise is under a BSD license, a copy of which is in
+[LICENSE-rnnoise](LICENSE-rnnoise). `pipeline/denoise.vx` ports its C code to Vx, under the same
+license.
+
+- Code and weights: <https://github.com/xiph/rnnoise>, the tag `v0.1.1` (commit 6cbfd53e).
+  The weights are `src/rnn_data.c` (SHA-256
+  `7b90ed18f065a34597d80b4c00e140a7c5eb6380ef8c9c6bf265384c944ae708`), and the table is
+  `src/tansig_table.h`.
+- The paper: Jean-Marc Valin, "A Hybrid DSP/Deep Learning Approach to Real-Time Full-Band
+  Speech Enhancement", MMSP 2018. <https://arxiv.org/abs/1709.08243>
+
+The network takes 42 features of a frame of 10 ms of audio at 48 kHz. A dense layer and three
+GRUs (24, 48 and 96 units) give a gain for each of 22 bands, and the probability of a voice.
+
+## What changed
+
+`rnn_data.c` stores the weights as int8 values, and the network scales each sum by 1/256.
+`tools/convert_rnnoise.py` writes the same values as float32, one layer after another: for
+each layer its input weights, then its recurrent weights (a GRU only), then its bias, in the
+layout of `rnn_data.c`. After them come the 201 values of the table of tanh. That is 87704
+floats. Nothing else changed.
+
+    python3 tools/convert_rnnoise.py rnnoise/src models/rnnoise.f32
+
+`make check-denoise` compares the Vx port with the C code on the same audio
+(`tools/check_denoise.py`).

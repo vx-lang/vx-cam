@@ -106,6 +106,36 @@ static inline void vxcam_model_frame(float *mask, const float *small, const floa
 #undef VXCAM_SLICE
 }
 
+// Noise removal for the microphone: RNNoise v0.1.1 in Vx (pipeline/denoise.vx), on the CPU. A
+// frame is 480 samples at 48 kHz, with the values of 16-bit audio, and the output is 10 ms
+// behind the input. The weights are models/rnnoise.f32, VXCAM_DENOISE_WEIGHTS floats.
+// vxcam_denoise_init fills the tables once. The state starts as zeros. stats gets the
+// probability of a voice, the pitch period, and 1 for a frame without sound.
+#define VXCAM_DENOISE_FRAME 480
+#define VXCAM_DENOISE_WEIGHTS 87704
+#define VXCAM_DENOISE_TABLES 2922
+#define VXCAM_DENOISE_STATE 3059
+#define VXCAM_DENOISE_STATS 3
+
+void vxcam_denoise_init(VXCAM_TENSOR2_ARGS(float));
+void vxcam_denoise(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(const float),
+                   VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(const float),
+                   VXCAM_TENSOR2_ARGS(const float), VXCAM_TENSOR2_ARGS(float), int32_t enabled);
+
+static inline void vxcam_denoise_tables(float *tables) {
+  vxcam_denoise_init(VXCAM_TENSOR2(tables, 1, VXCAM_DENOISE_TABLES));
+}
+
+static inline void vxcam_denoise_frame(float *out, const float *in, float *state,
+                                       const float *weights, const float *tables, float *stats,
+                                       int32_t enabled) {
+  vxcam_denoise(VXCAM_TENSOR2(out, 1, VXCAM_DENOISE_FRAME), VXCAM_TENSOR2(in, 1, VXCAM_DENOISE_FRAME),
+                VXCAM_TENSOR2(state, 1, VXCAM_DENOISE_STATE),
+                VXCAM_TENSOR2(weights, 1, VXCAM_DENOISE_WEIGHTS),
+                VXCAM_TENSOR2(tables, 1, VXCAM_DENOISE_TABLES),
+                VXCAM_TENSOR2(stats, 1, VXCAM_DENOISE_STATS), enabled);
+}
+
 void vxcam_smooth(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
                   VXCAM_TENSOR2_ARGS(const float), VXCAM_TENSOR2_ARGS(int32_t),
                   VXCAM_TENSOR2_ARGS(float), int32_t sw, int32_t sh, int32_t w, int32_t h,
