@@ -9,7 +9,8 @@ https://github.com/user-attachments/assets/33ab1bb1-ff01-4ae8-998b-349e8f02403a
 
 `make demo` wrote this movie. Every 56 frames, the app moves one stage to the other device, and
 it visits all 32 placements. The output does not change: the checks of the two devices find 0
-values that differ.
+values that differ. The movie writer uses the CPU at the same time, so `composite` takes about
+8.5 ms on the CPU in the movie, and 2.6 ms without the writer.
 
 ## Status
 
