@@ -235,18 +235,29 @@ func drawPanel(on pb: CVPixelBuffer, _ p: Pipeline, fps: Double) {
   y -= row
   let laneX = lanes.count == 1 ? x0 : x0 + 104
   let laneW = strip - (laneX - x0)
-  ctx.setStrokeColor(dim)
+  // A lane is as wide as the budget, or as the longest lane when a frame takes longer. Then a
+  // white line marks the end of the budget.
+  let scale = max(budget, lanes.map { $0.stages.reduce(0) { $0 + $1.ms } }.max() ?? 0)
   for (label, stages) in lanes {
     if !label.isEmpty { text(label, x0, y, dim, size: 14) }
+    ctx.setStrokeColor(dim)
     ctx.stroke(CGRect(x: laneX, y: y - 5, width: laneW, height: 22), width: 1)
     var x = laneX
     for st in stages {
-      let wide = laneW * min(st.ms / budget, 1)
+      let wide = laneW * st.ms / scale
       box(
         CGRect(x: x, y: y - 5, width: max(wide - 1, 1), height: 22), st.gpu ? gpu : cpu, radius: 0)
       let short = String(st.name.prefix(wide > 70 ? 7 : 3))
       if wide > 30 { text(short, x + 4, y, black, size: 13, bold: true) }
       x += wide
+    }
+    if scale > budget {
+      let end = laneX + laneW * budget / scale
+      ctx.saveGState()
+      ctx.setStrokeColor(white)
+      ctx.setLineWidth(2)
+      ctx.strokeLineSegments(between: [CGPoint(x: end, y: y - 8), CGPoint(x: end, y: y + 20)])
+      ctx.restoreGState()
     }
     y -= row
   }
