@@ -78,40 +78,44 @@ frame : &Tensor<u8, [?, ?], Memory::HBM>, sw : i32, sh : i32, scale : i32) -> vo
 
 // The whole network, from `small` to `mask` (sh x sw). The shell passes slices
 // of one arena for the rest: inp, the encoder's three skips s1 to s3, the work
-// images ta to td, the model's own mask mm, and `means`, `gate` and `gate2`
-// (128 each; gate2 is the gate of the head).
+// images ta to td, the model's own mask mm, `parts` (2304: the sums of
+// channel_sums), and `gate` and `gate2` (128 each; gate2 is the gate of the head).
 pub fn vxcam_model(mask : &mut Tensor<f32, [?, ?], Memory::HBM>,
 small : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>,
 inp : &mut Tensor<f32, [?, ?], Memory::HBM>, s1 : &mut Tensor<f32, [?, ?], Memory::HBM>,
 s2 : &mut Tensor<f32, [?, ?], Memory::HBM>, s3 : &mut Tensor<f32, [?, ?], Memory::HBM>,
 ta : &mut Tensor<f32, [?, ?], Memory::HBM>, tb : &mut Tensor<f32, [?, ?], Memory::HBM>,
 tc : &mut Tensor<f32, [?, ?], Memory::HBM>, td : &mut Tensor<f32, [?, ?], Memory::HBM>,
-mm : &mut Tensor<f32, [?, ?], Memory::HBM>, means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+mm : &mut Tensor<f32, [?, ?], Memory::HBM>, parts : &mut Tensor<f32, [?, ?], Memory::HBM>,
 gate : &mut Tensor<f32, [?, ?], Memory::HBM>, gate2 : &mut Tensor<f32, [?, ?], Memory::HBM>,
-sw : i32, sh : i32) -> void {
+sw : i32, sh : i32, tiles : i32) -> void {
   model_input(inp, small, sw, sh);
   // 144 x 256 x 3 -> 72 x 128 x 16
   conv_kxk(s1, inp, wts, 0, 144, 256, 3, 72, 128, 16, 3, 2, 0, 0, 2);
   let mut off : i32 = 16 * 9 * 3 + 16;
   // The encoder. Activation 1 is relu, 2 is hard swish.
-  off = encoder_block(s2, s1, ta, tb, means, gate, wts, off, 72, 128, 16, 16, 16, 3, 2, 1, 8, 0);
-  off = encoder_block(tc, s2, ta, tb, means, gate, wts, off, 36, 64, 16, 72, 24, 3, 2, 1, 0, 0);
-  off = encoder_block(s3, tc, ta, tb, means, gate, wts, off, 18, 32, 24, 88, 24, 3, 1, 1, 0, 1);
-  off = encoder_block(tc, s3, ta, tb, means, gate, wts, off, 18, 32, 24, 96, 32, 5, 2, 2, 24, 0);
-  off = encoder_block(td, tc, ta, tb, means, gate, wts, off, 9, 16, 32, 128, 32, 5, 1, 2, 32, 1);
-  off = encoder_block(tc, td, ta, tb, means, gate, wts, off, 9, 16, 32, 128, 32, 5, 1, 2, 32, 1);
-  off = encoder_block(td, tc, ta, tb, means, gate, wts, off, 9, 16, 32, 96, 32, 5, 1, 2, 24, 1);
-  off = encoder_block(tc, td, ta, tb, means, gate, wts, off, 9, 16, 32, 96, 32, 5, 1, 2, 24, 1);
+  off = encoder_block<16, 16, 16>(s2, s1, ta, tb, parts, gate, wts, off, 72, 128, 3, 2, 1, 8, 0, tiles);
+  off = encoder_block<16, 72, 24>(tc, s2, ta, tb, parts, gate, wts, off, 36, 64, 3, 2, 1, 0, 0, tiles);
+  off = encoder_block<24, 88, 24>(s3, tc, ta, tb, parts, gate, wts, off, 18, 32, 3, 1, 1, 0, 1, tiles);
+  off = encoder_block<24, 96, 32>(tc, s3, ta, tb, parts, gate, wts, off, 18, 32, 5, 2, 2, 24, 0, tiles);
+  off = encoder_block<32, 128, 32>(td, tc, ta, tb, parts, gate, wts, off, 9, 16, 5, 1, 2, 32, 1, tiles);
+  off = encoder_block<32, 128, 32>(tc, td, ta, tb, parts, gate, wts, off, 9, 16, 5, 1, 2, 32, 1, tiles);
+  off = encoder_block<32, 96, 32>(td, tc, ta, tb, parts, gate, wts, off, 9, 16, 5, 1, 2, 24, 1, tiles);
+  off = encoder_block<32, 96, 32>(tc, td, ta, tb, parts, gate, wts, off, 9, 16, 5, 1, 2, 24, 1, tiles);
   // The head: relu(1 x 1 conv) of the last block, gated by a sigmoid of its mean.
-  channel_mean(means, tc, tc, 144, 32, 0);
-  pw(ta, tc, tc, tc, tc, wts, off, 144, 32, 128, 0, 0, 0, 1);
+  channel_sums(parts, tc, tc, 144, 32, 0);
+  if tiles == 1 {
+    pw_tiles<32, 128, 16>(ta, tc, tc, tc, tc, wts, off, 144, 0, 0, 0, 1);
+  } else {
+    pw(ta, tc, tc, tc, tc, wts, off, 144, 32, 128, 0, 0, 0, 1);
+  }
   off = off + 128 * 32 + 128;
-  pw(gate2, means, means, means, means, wts, off, 1, 32, 128, 0, 0, 0, 3);
+  head_gate(gate2, parts, 144, wts, off, 32);
   off = off + 128 * 32 + 128;
   // The decoder: 9 x 16 -> 18 x 32 -> 36 x 64 -> 72 x 128.
-  off = decoder_stage(td, ta, s3, tb, tc, means, gate, gate2, 1, wts, off, 9, 16, 128, 24);
-  off = decoder_stage(ta, td, s2, tb, tc, means, gate, gate2, 0, wts, off, 18, 32, 24, 16);
-  off = decoder_stage(td, ta, s1, tb, tc, means, gate, gate2, 0, wts, off, 36, 64, 16, 16);
+  off = decoder_stage<24>(td, ta, s3, tb, tc, parts, gate, gate2, 1, wts, off, 9, 16, 128, tiles);
+  off = decoder_stage<16>(ta, td, s2, tb, tc, parts, gate, gate2, 0, wts, off, 18, 32, 24, tiles);
+  off = decoder_stage<16>(td, ta, s1, tb, tc, parts, gate, gate2, 0, wts, off, 36, 64, 16, tiles);
   out_tconv(mm, td, wts, off, 72, 128, 16);
   mask_resample(mask, mm, sw, sh);
   return;

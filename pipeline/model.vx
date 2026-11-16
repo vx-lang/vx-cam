@@ -6,10 +6,11 @@
 // of the network, so each layer's weights start where the last one's end. Each
 // layer is a conv kernel (OHWI, or 1HWC for a depthwise one) and then its bias.
 //
-// Every buffer is flat, [1, n], and holds an image as HWC. Each kernel has one
+// Every buffer is flat, [1, n], and holds an image as HWC. Most kernels have one
 // lane per output element. A sigmoid needs exp, and the CPU and the GPU need
 // not agree on its last bit, so `exp_f32` uses only + - * / and gives the same
-// bits on both.
+// bits on both. Every kernel gives the same bits on both devices, except
+// `pw_tiles` (VXCAM_MODEL=tiles in the shell).
 //
 // This file holds the layers. `vxcam_model` in vxcam.vx chains them into the
 // network: vxc exports only the `pub fn`s of the file it compiles.
@@ -166,6 +167,72 @@ act : i32) -> void {
   return;
 }
 
+// pw with matmuls of tiles, which the Apple GPU runs on its simdgroup matrices.
+// Each subgroup makes 8 pixels by 8 output channels, and adds 8 input channels
+// at a time. A block has two subgroups, so npix is a multiple of 16. The channel
+// counts are numbers, and NCT is COUT / 8, so that the compiler can prove that
+// no two blocks write the same element of dst. Lane i takes row h * 4 + i / 8
+// and column i % 8 of a tile, for h in 0 and 1.
+fn pw_tiles<const CIN : i32, const COUT : i32, const NCT : i32>(
+dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>,
+src2 : &Tensor<f32, [?, ?], Memory::HBM>, gate : &Tensor<f32, [?, ?], Memory::HBM>,
+res : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
+npix : i32, use_gate : i32, use_src2 : i32, use_res : i32, act : i32) -> void {
+  spawn on(Topology::Device) {
+    for gp in 0..npix / 16 across blocks {
+      for ct in 0..NCT across blocks {
+        let mut sa = unsafe { Tensor<f32, [2, 8, 8], Memory::SMEM>::uninit() };
+        let mut sb = unsafe { Tensor<f32, [2, 8, 8], Memory::SMEM>::uninit() };
+        let mut acc = unsafe {
+          Tensor<f32, [2, 8, 8], Memory::SMEM>::uninit()
+        };
+        for w in 0..2 across subgroups {
+          let pt = gp * 2 + w;
+          for i in 0..32 across lanes {
+            for h in 0..2 {
+              acc[w][h * 4 + i / 8][i % 8] = 0.0;
+            }
+          }
+          for kk in 0..CIN / 8 {
+            for i in 0..32 across lanes {
+              for h in 0..2 {
+                let r = h * 4 + i / 8;
+                let c = i % 8;
+                let p = pt * 8 + r;
+                let ci = kk * 8 + c;
+                let mut v = src[0][p * CIN + ci];
+                if use_gate == 1 {
+                  v = v * gate[0][ci];
+                }
+                if use_src2 == 1 {
+                  v = v + src2[0][p * CIN + ci];
+                }
+                sa[w][r][c] = v;
+                sb[w][r][c] = wts[0][off + (ct * 8 + c) * CIN + kk * 8 + r];
+              }
+            }
+            acc[w] = acc[w] + sa[w] @ sb[w];
+          }
+          for i in 0..32 across lanes {
+            for h in 0..2 {
+              let r = h * 4 + i / 8;
+              let c = i % 8;
+              let p = pt * 8 + r;
+              let co = ct * 8 + c;
+              let mut out = activate(acc[w][r][c] + wts[0][off + COUT * CIN + co], act);
+              if use_res == 1 {
+                out = out + res[0][p * COUT + co];
+              }
+              dst[0][p * COUT + co] = out;
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
 // A k x k depthwise convolution with stride s, SAME padding. After the
 // activation, it adds its own input when `use_res` is 1 (stride 1 only).
 fn dw(dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>,
@@ -203,24 +270,32 @@ ow : i32, k : i32, s : i32, pt : i32, pl : i32, act : i32, use_res : i32) -> voi
   return;
 }
 
-// means[c] = the mean over `npix` pixels of a, plus b when `use_b` is 1.
-fn channel_mean(means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+// The pixels of the image in runs of 64: parts[q * c + ch] is the sum of
+// channel ch over run q, of a plus b when `use_b` is 1. One lane for each run
+// and channel, so that the sums spread over the GPU.
+fn channel_sums(parts : &mut Tensor<f32, [?, ?], Memory::HBM>,
 a : &Tensor<f32, [?, ?], Memory::HBM>, b : &Tensor<f32, [?, ?], Memory::HBM>, npix : i32,
 c : i32, use_b : i32) -> void {
+  let n = (npix + 63) / 64 * c;
   spawn on(Topology::Device) {
-    for g in 0..(c + 255) / 256 across blocks {
+    for g in 0..(n + 255) / 256 across blocks {
       for l in 0..256 across lanes(256) {
-        let ch = g * 256 + l;
-        if ch < c {
+        let i = g * 256 + l;
+        if i < n {
+          let q = i / c;
+          let ch = i - q * c;
           let mut acc : f32 = 0.0;
-          for p in 0..npix {
-            let mut v = a[0][p * c + ch];
-            if use_b == 1 {
-              v = v + b[0][p * c + ch];
+          for k in 0..64 {
+            let p = q * 64 + k;
+            if p < npix {
+              let mut v = a[0][p * c + ch];
+              if use_b == 1 {
+                v = v + b[0][p * c + ch];
+              }
+              acc = acc + v;
             }
-            acc = acc + v;
           }
-          means[0][ch] = acc / (npix as f32);
+          parts[0][i] = acc;
         }
       }
     }
@@ -229,27 +304,75 @@ c : i32, use_b : i32) -> void {
 }
 
 // The squeeze-and-excite gate: gate = sigmoid(W2 relu(W1 means + b1) + b2),
-// with c channels and m hidden ones. Each lane works out the hidden layer again,
-// which costs m * c multiplies and saves a launch.
+// with c channels (at most 128) and m hidden ones, where `means` are the means
+// over `npix` pixels from the sums of `channel_sums`. One block, in three steps.
 fn se_gate(gate : &mut Tensor<f32, [?, ?], Memory::HBM>,
-means : &Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>, off : i32,
-c : i32, m : i32) -> void {
+parts : &Tensor<f32, [?, ?], Memory::HBM>, npix : i32, wts : &Tensor<f32, [?, ?], Memory::HBM>,
+off : i32, c : i32, m : i32) -> void {
+  assert(c <= 128 && m <= 128, "se_gate takes at most 128 channels");
+  let runs = (npix + 63) / 64;
   spawn on(Topology::Device) {
-    for g in 0..(c + 255) / 256 across blocks {
-      for l in 0..256 across lanes(256) {
-        let co = g * 256 + l;
-        if co < c {
-          let off2 = off + m * c + m;
-          let mut acc = wts[0][off2 + c * m + co];
-          for j in 0..m {
-            let mut hj = wts[0][off + m * c + j];
-            for ci in 0..c {
-              hj = hj + wts[0][off + j * c + ci] * means[0][ci];
-            }
-            acc = acc + wts[0][off2 + co * m + j] * max_f32(hj, 0.0);
+    for g in 0..1 across blocks {
+      let mut means = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      let mut hidden = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for l in 0..128 across lanes(128) {
+        if l < c {
+          let mut acc : f32 = 0.0;
+          for q in 0..runs {
+            acc = acc + parts[0][q * c + l];
           }
-          gate[0][co] = activate(acc, 3);
+          means[l] = acc / (npix as f32);
         }
+      }
+      for l in 0..128 across lanes(128) {
+        if l < m {
+          let mut h = wts[0][off + m * c + l];
+          for ci in 0..c {
+            h = h + wts[0][off + l * c + ci] * means[ci];
+          }
+          hidden[l] = max_f32(h, 0.0);
+        }
+      }
+      for l in 0..128 across lanes(128) {
+        if l < c {
+          let off2 = off + m * c + m;
+          let mut acc = wts[0][off2 + c * m + l];
+          for j in 0..m {
+            acc = acc + wts[0][off2 + l * m + j] * hidden[j];
+          }
+          gate[0][l] = activate(acc, 3);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The gate of the head: gate = sigmoid(W means + b), from c channels (at most
+// 128) to 128, where `means` come from the sums of `channel_sums` as in se_gate.
+fn head_gate(gate : &mut Tensor<f32, [?, ?], Memory::HBM>,
+parts : &Tensor<f32, [?, ?], Memory::HBM>, npix : i32, wts : &Tensor<f32, [?, ?], Memory::HBM>,
+off : i32, c : i32) -> void {
+  assert(c <= 128, "head_gate takes at most 128 channels");
+  let runs = (npix + 63) / 64;
+  spawn on(Topology::Device) {
+    for g in 0..1 across blocks {
+      let mut means = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for l in 0..128 across lanes(128) {
+        if l < c {
+          let mut acc : f32 = 0.0;
+          for q in 0..runs {
+            acc = acc + parts[0][q * c + l];
+          }
+          means[l] = acc / (npix as f32);
+        }
+      }
+      for l in 0..128 across lanes(128) {
+        let mut acc = wts[0][off + 128 * c + l];
+        for ci in 0..c {
+          acc = acc + wts[0][off + l * c + ci] * means[ci];
+        }
+        gate[0][l] = activate(acc, 3);
       }
     }
   }
@@ -358,29 +481,40 @@ mm : &Tensor<f32, [?, ?], Memory::HBM>, sw : i32, sh : i32) -> void {
 // channels, a k x k depthwise conv with stride s, the squeeze-and-excite gate
 // when `se` is not 0 (with `se` hidden channels), then project to cout, and add
 // x when `use_res` is 1. Returns the offset of the next layer's weights.
-fn encoder_block(out : &mut Tensor<f32, [?, ?], Memory::HBM>,
+fn encoder_block<const CIN : i32, const MID : i32, const COUT : i32>(out : &mut Tensor<f32, [?, ?], Memory::HBM>,
 x : &Tensor<f32, [?, ?], Memory::HBM>, ta : &mut Tensor<f32, [?, ?], Memory::HBM>,
-tb : &mut Tensor<f32, [?, ?], Memory::HBM>, means : &mut Tensor<f32, [?, ?], Memory::HBM>,
+tb : &mut Tensor<f32, [?, ?], Memory::HBM>, parts : &mut Tensor<f32, [?, ?], Memory::HBM>,
 gate : &mut Tensor<f32, [?, ?], Memory::HBM>, wts : &Tensor<f32, [?, ?], Memory::HBM>,
-off0 : i32, h : i32, w : i32, cin : i32, mid : i32, cout : i32, k : i32, s : i32, act : i32,
-se : i32, use_res : i32) -> i32 {
+off0 : i32, h : i32, w : i32, k : i32, s : i32, act : i32, se : i32, use_res : i32,
+tiles : i32) -> i32 {
+  let cin = CIN;
+  let mid = MID;
+  let cout = COUT;
   let mut off = off0;
   let oh = (h + s - 1) / s;
   let ow = (w + s - 1) / s;
   let pt = max_i32((oh - 1) * s + k - h, 0) / 2;
   let pl = max_i32((ow - 1) * s + k - w, 0) / 2;
-  pw(ta, x, x, x, x, wts, off, h * w, cin, mid, 0, 0, 0, act);
+  if tiles == 1 {
+    pw_tiles<CIN, MID, MID / 8>(ta, x, x, x, x, wts, off, h * w, 0, 0, 0, act);
+  } else {
+    pw(ta, x, x, x, x, wts, off, h * w, cin, mid, 0, 0, 0, act);
+  }
   off = off + mid * cin + mid;
   dw(tb, ta, wts, off, h, w, mid, oh, ow, k, s, pt, pl, act, 0);
   off = off + k * k * mid + mid;
   let mut use_gate : i32 = 0;
   if se != 0 {
-    channel_mean(means, tb, tb, oh * ow, mid, 0);
-    se_gate(gate, means, wts, off, mid, se);
+    channel_sums(parts, tb, tb, oh * ow, mid, 0);
+    se_gate(gate, parts, oh * ow, wts, off, mid, se);
     off = off + se * mid + se + mid * se + mid;
     use_gate = 1;
   }
-  pw(out, tb, tb, gate, x, wts, off, oh * ow, mid, cout, use_gate, 0, use_res, 0);
+  if tiles == 1 {
+    pw_tiles<MID, COUT, COUT / 8>(out, tb, tb, gate, x, wts, off, oh * ow, use_gate, 0, use_res, 0);
+  } else {
+    pw(out, tb, tb, gate, x, wts, off, oh * ow, mid, cout, use_gate, 0, use_res, 0);
+  }
   return off + cout * mid + cout;
 }
 
@@ -388,21 +522,26 @@ se : i32, use_res : i32) -> i32 {
 // 2w x cout): U = a 1 x 1 conv of x scaled up 2x, then the gate of skip + U,
 // V = skip * gate + U, P = relu(1 x 1 conv of V), and out = P + relu(depthwise
 // 3 x 3 conv of P). Returns the offset of the next layer's weights.
-fn decoder_stage(out : &mut Tensor<f32, [?, ?], Memory::HBM>,
+fn decoder_stage<const COUT : i32>(out : &mut Tensor<f32, [?, ?], Memory::HBM>,
 x : &Tensor<f32, [?, ?], Memory::HBM>, skip : &Tensor<f32, [?, ?], Memory::HBM>,
 tu : &mut Tensor<f32, [?, ?], Memory::HBM>, tp : &mut Tensor<f32, [?, ?], Memory::HBM>,
-means : &mut Tensor<f32, [?, ?], Memory::HBM>, gate : &mut Tensor<f32, [?, ?], Memory::HBM>,
+parts : &mut Tensor<f32, [?, ?], Memory::HBM>, gate : &mut Tensor<f32, [?, ?], Memory::HBM>,
 xgate : &Tensor<f32, [?, ?], Memory::HBM>, use_xgate : i32,
 wts : &Tensor<f32, [?, ?], Memory::HBM>, off0 : i32, h : i32, w : i32, cin : i32,
-cout : i32) -> i32 {
+tiles : i32) -> i32 {
+  let cout = COUT;
   let mut off = off0;
   let npix = 4 * h * w;
   up_pw(tu, x, xgate, wts, off, h, w, cin, cout, use_xgate);
   off = off + cout * cin + cout;
-  channel_mean(means, skip, tu, npix, cout, 1);
-  se_gate(gate, means, wts, off, cout, cout);
+  channel_sums(parts, skip, tu, npix, cout, 1);
+  se_gate(gate, parts, npix, wts, off, cout, cout);
   off = off + 2 * (cout * cout + cout);
-  pw(tp, skip, tu, gate, skip, wts, off, npix, cout, cout, 1, 1, 0, 1);
+  if tiles == 1 {
+    pw_tiles<COUT, COUT, COUT / 8>(tp, skip, tu, gate, skip, wts, off, npix, 1, 1, 0, 1);
+  } else {
+    pw(tp, skip, tu, gate, skip, wts, off, npix, cout, cout, 1, 1, 0, 1);
+  }
   off = off + cout * cout + cout;
   dw(out, tp, wts, off, 2 * h, 2 * w, cout, 2 * h, 2 * w, 3, 1, 1, 1, 1, 1);
   return off + 9 * cout + cout;

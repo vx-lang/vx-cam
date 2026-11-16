@@ -59,7 +59,9 @@ static inline void vxcam_segment_image(float *mask, float *background, const flo
 // The model in place of segment's stand-in: MediaPipe Selfie Segmentation, landscape
 // (models/README.md). Its weights are VXCAM_MODEL_WEIGHTS floats. Its 12 buffers are slices
 // of one arena, each from the start of a 16 KB page: the 144 x 256 x 3 input, three skips,
-// four work images, the 144 x 256 mask, and the means and two gates.
+// four work images, the 144 x 256 mask, the sums of each channel, and two gates. With
+// `tiles` 1, the 1 x 1 convolutions use matmuls of tiles: faster on the GPU, but then the CPU
+// and the GPU do not give the same bits.
 #define VXCAM_MODEL_WEIGHTS 106401
 #define VXCAM_MODEL_BUFFERS 12
 
@@ -68,13 +70,14 @@ void vxcam_model(VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(const float),
                  VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
                  VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
                  VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float),
-                 VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float), int32_t sw, int32_t sh);
+                 VXCAM_TENSOR2_ARGS(float), VXCAM_TENSOR2_ARGS(float), int32_t sw, int32_t sh,
+                 int32_t tiles);
 
 static inline int64_t vxcam_model_size(int k) {
   static const int64_t sizes[VXCAM_MODEL_BUFFERS] = {144 * 256 * 3, 72 * 128 * 16, 36 * 64 * 16,
                                                      18 * 32 * 24,  36 * 64 * 72,  72 * 128 * 16,
                                                      72 * 128 * 16, 72 * 128 * 16, 144 * 256,
-                                                     128,           128,           128};
+                                                     2304,          128,           128};
   return sizes[k];
 }
 
@@ -90,7 +93,7 @@ static inline float *vxcam_model_input(float *arena) { return arena + vxcam_mode
 static inline float *vxcam_model_mask(float *arena) { return arena + vxcam_model_offset(8); }
 
 static inline void vxcam_model_frame(float *mask, const float *small, const float *weights,
-                                     float *arena, int64_t sw, int64_t sh) {
+                                     float *arena, int64_t sw, int64_t sh, int32_t tiles) {
   float *t[VXCAM_MODEL_BUFFERS];
   for (int k = 0; k < VXCAM_MODEL_BUFFERS; ++k)
     t[k] = arena + vxcam_model_offset(k);
@@ -99,7 +102,7 @@ static inline void vxcam_model_frame(float *mask, const float *small, const floa
               VXCAM_TENSOR2(weights, 1, VXCAM_MODEL_WEIGHTS), VXCAM_SLICE(0), VXCAM_SLICE(1),
               VXCAM_SLICE(2), VXCAM_SLICE(3), VXCAM_SLICE(4), VXCAM_SLICE(5), VXCAM_SLICE(6),
               VXCAM_SLICE(7), VXCAM_SLICE(8), VXCAM_SLICE(9), VXCAM_SLICE(10), VXCAM_SLICE(11),
-              (int32_t)sw, (int32_t)sh);
+              (int32_t)sw, (int32_t)sh, tiles);
 #undef VXCAM_SLICE
 }
 
