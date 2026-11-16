@@ -1,7 +1,8 @@
 # vx-cam
 
 A real-time camera pipeline written in [Vx](https://github.com/vx-lang/Vx): background blur plus
-auto-framing, with each stage placed on the CPU or the GPU of a MacBook. The plan is in
+auto-framing, with each stage placed on the CPU or the GPU of a MacBook, and noise removal for
+the microphone on the CPU. The plan is in
 [`vx-cam-laptop-heterogeneous-proposal.md`](vx-cam-laptop-heterogeneous-proposal.md), filed as
 [vx-lang/Vx#2688](https://github.com/vx-lang/Vx/issues/2688).
 
@@ -118,6 +119,56 @@ Two more tries:
 Core ML runs the same model in 1.47 ms on the GPU. Vx's `segment` takes 1.49 ms with every
 stage on the GPU, and 2.00 ms alone on the GPU, which idles between frames. Both include
 resizing in and out.
+
+## Noise removal
+
+While the GPU runs the video, the CPU cleans the sound of the microphone. It runs RNNoise
+v0.1.1 by Jean-Marc Valin (Mozilla and the Xiph.Org Foundation, BSD license, see
+[models/README.md](models/README.md)), a small recurrent network, ported to Vx in
+[`pipeline/denoise.vx`](pipeline/denoise.vx). Audio comes in frames of 10 ms at 48 kHz. Each
+frame needs the state of the frame before, and its work is small, so it runs on one core of
+the CPU: 0.1 to 0.2 ms a frame. On the GPU, a stage with one launch spends about 0.7 ms on the
+launch and the wait alone ([part 4 of the bench](#measurements)), more than the whole frame on
+the CPU.
+
+With the camera, the key `n` turns the noise removal on and off, and `p` plays the cleaned
+sound. Use headphones: the speakers next to the microphone make a loop. The overlay gives the
+time of a frame.
+
+The port follows the C code of RNNoise step by step: a high-pass filter, a window of 20 ms and
+an FFT of 960 points, the energy of 22 bands, a search for the pitch, 42 features, the network,
+a comb filter at the pitch, the gains, and the inverse FFT with overlap-add. Where the C code
+computes in double, the port computes in f64. The output is 10 ms behind the input.
+
+`make check-denoise` builds the C code and runs both on the same audio: 20 seconds of speech
+from `say`, with real typing (a CC0 recording of a Cherry keyboard) and the noise of a fan
+(`tools/make_noisy_speech.swift`, [`tools/check_denoise.py`](tools/check_denoise.py)):
+
+- The Vx output is 131 dB above its difference from the C output.
+- Where nobody speaks, both make the noise 17.0 dB quieter. In the frames with speech, the
+  level drops by 0.1 dB.
+
+The typing does not go away completely. It is 17 dB quieter in the pauses, and the network
+leaves more of it while someone speaks. Synthetic clicks, bursts of noise of 20 ms, were only
+2.4 dB quieter, so the result depends on the sound of the keyboard.
+
+What the noise removal costs the video, with the cleaning of a file on another thread, one frame
+every 10 ms as from a microphone (`VXCAM_AUDIO`). Median of three runs over 1,080 frames, taken
+in turn:
+
+| Setup | Without the noise removal | With it | A frame of sound |
+| --- | ---: | ---: | ---: |
+| all on the GPU, one frame after another (five runs) | 3.47 ms | 3.46 ms | 0.12 ms |
+| all on the GPU, frames overlapping | 2.87 ms | 2.87 ms | 0.13 ms |
+| the model on both devices, the rest on the CPU | 5.77 ms | 5.94 ms | 0.16 ms |
+
+With the video on the GPU, the noise removal costs it nothing. With the model alternating, the
+CPU is busy, and the frame takes 3% longer.
+
+`make noise-demo` writes `build/noise.mov`: the test clip with the noisy speech, where the
+noise removal turns on and off every 4 seconds, and the panel says when it is on. Where nobody
+speaks, the sound of the movie is 12.8 to 23.0 dB quieter than the noisy input in the spans with
+the noise removal on, and within 0.2 dB of it in the spans with it off.
 
 ## Measurements
 
@@ -310,6 +361,13 @@ make compare TFLITE=selfie_segmentation_landscape.tflite
               # file. Give BENCH_PYTHON= a Python with tflite and coremltools.
 make bench    # the measurements above, in build/bench/report.md (about an hour; see
               # tools/bench.py for TFLITE=, BENCH_PYTHON= and BENCH_ALSO=)
+make denoise  # remove the noise from build/noisy_speech.wav (speech, typing and a fan) and
+              # write build/clean_speech.wav. AUDIO=file takes another file or movie
+make check-denoise RNNOISE=<RNNoise at v0.1.1>
+              # compare the noise removal with the C code of RNNoise on the test audio
+make noise-demo
+              # write build/noise.mov: the test clip with the test audio, where the noise
+              # removal turns on and off every 4 seconds
 make format   # format the Vx code with vx-format and the Swift code with swift-format
 ```
 
@@ -326,6 +384,10 @@ change how it runs:
 - `VXCAM_MODEL=tiles`: the model's 1 x 1 convolutions use matmuls of tiles. That is faster on the
   GPU, but then the CPU and the GPU differ in the last bits of the mask.
 - `VXCAM_BITRATE=B`: the bits a second of a movie from `--write` or `--compare`.
+- `VXCAM_AUDIO=file`: with `--write`, the movie gets the sound of the file, cleaned by the noise
+  removal. With `--headless`, another thread cleans it, one frame every 10 ms, while the video
+  runs. `VXCAM_DENOISE=off` passes the sound through without the gains, and
+  `VXCAM_DENOISE=every:S` turns the noise removal on and off every S seconds.
 - `VXCAM_VIEW=mask` or `noblur`, and `VXCAM_OUTLINE=1`: what the output shows (the keys `m`,
   `b` and `e` in the window).
 - `VXCAM_COMPARE_EVERY=K`: compare the devices every K frames (0 never; by default the last
@@ -338,7 +400,8 @@ folder. `.gitignore` keeps `*.mov` files here out of git.
 
 Keys in the window: `m` mask view, `e` outline (the mask's edge), `b` blur off, `f` auto-framing off, `1`-`5` move a
 stage between the CPU and the GPU, `a` let the app move the stages, `r` learn the background
-again (stand-in only), `o` overlay, space pause, `q` quit.
+again (stand-in only), `n` noise removal on and off, `p` play the cleaned sound of the
+microphone (use headphones), `o` overlay, space pause, `q` quit.
 
 ## Layout
 
@@ -347,6 +410,7 @@ again (stand-in only), `o` overlay, space pause, `q` quit.
 | `pipeline/vxcam.vx` | The compute: every stage is a `pub fn`, compiled with `vxc --machine fleet/m4-uma.vx` |
 | `pipeline/model.vx` | The layers of the segmentation model, which `vxcam_model` in vxcam.vx chains |
 | `pipeline/common.vx` | The helpers that the stages and the model share |
+| `pipeline/denoise.vx` | The noise removal: RNNoise v0.1.1, ported from its C code |
 | `pipeline/vxcam.h` | The C interface of those functions, for the shell |
 | `shell/main.swift` | The host shell's command line. The shell has no compute |
 | `shell/Pipeline.swift` | The buffers, and the Vx stages called one frame at a time |
@@ -355,14 +419,18 @@ again (stand-in only), `o` overlay, space pause, `q` quit.
 | `shell/Headless.swift`, `Movie.swift`, `Window.swift` | `--headless`, `--write`, and the window with its overlay and keys |
 | `shell/Compare.swift` | `--compare`: a movie of the model moving between devices, in Core ML and in Vx |
 | `shell/Sources.swift` | Frames from a movie file or the camera |
-| `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera |
+| `shell/Audio.swift` | The noise removal: sound from a file or the microphone, `--denoise`, and playback |
+| `shell/Info.plist` | Linked into the binary, so macOS can say why it asks for the camera and the microphone |
 | `tools/make_test_clip.swift` | Draws the test clip: a figure walks across a still room |
-| `models/` | The segmentation model's weights, its license and where it comes from |
+| `models/` | The weights of the segmentation model and of the noise removal, their licenses and where they come from |
 | `tools/convert_model.py` | Writes those weights from Google's .tflite file |
 | `tools/check_model.py` | Compares vx-cam's mask with TFLite's, on the frames that `--headless` writes |
 | `tools/bench.py` | `make bench`: bits, placements, overlap, launches and copies, the model against TFLite and Core ML, the model on both devices, stages that move while the app runs |
 | `tools/baseline_model.py` | Times the model in TFLite and Core ML, and checks their masks against TFLite's |
 | `tools/coreml_model.py` | Builds the Core ML model from the .tflite file, layer by layer |
+| `tools/convert_rnnoise.py` | Writes the weights of the noise removal from RNNoise's `rnn_data.c` |
+| `tools/make_noisy_speech.swift` | Writes the test audio: speech, real typing and a fan |
+| `tools/rnnoise_reference.c`, `tools/check_denoise.py` | `make check-denoise`: the C code of RNNoise against the Vx port |
 
 The shell owns every buffer and passes it to Vx as a tensor. It times each stage call for the
 overlay. "Bytes moved" is 0: no stage copies a buffer, on either device. The host code at the

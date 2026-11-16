@@ -178,9 +178,10 @@ check-denoise: all build/noisy_speech.wav build/rnnoise_reference
 	  build/clean_c.f32 build/clean_vx.f32
 
 # Writes build/noise.mov: the test clip with the test audio, 24 seconds, where the noise removal
-# turns on and off every 4 seconds. The panel says when it is on.
+# turns on and off every 4 seconds. The panel says when it is on. The video runs on the GPU, so
+# the CPU is free for the sound. The bitrate keeps the movie under 10 MB, as for make demo.
 noise-demo: all build/noisy_speech.wav
-	VXCAM_AUDIO=build/noisy_speech.wav VXCAM_DENOISE=every:4 \
+	VXCAM_GPU=all VXCAM_AUDIO=build/noisy_speech.wav VXCAM_DENOISE=every:4 VXCAM_BITRATE=2500000 \
 	  ./build/vx-cam $(CLIP) --write build/noise.mov outline panel 720
 
 build:
