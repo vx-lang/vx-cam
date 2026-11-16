@@ -16,9 +16,10 @@
 //   vx-cam --camera                        run on the default camera in a window
 //   vx-cam <clip.mov> --headless N [dir]   run N frames, print the stage table (medians),
 //                                          and write a few frames as PNG to dir
-//   vx-cam <clip.mov> --write out.mov [mask] [outline] [panel]
+//   vx-cam <clip.mov> --write out.mov [mask] [outline] [panel] [N]
 //                                          run every frame once and write the output to out.mov:
-//                                          the mask view, the mask's outline, the stage panel
+//                                          the mask view, the mask's outline, the stage panel.
+//                                          With N, run N frames and loop the clip
 //   vx-cam <clip.mov> --compare out.mov [N]
 //                                          write a movie of the model moving between devices
 //                                          each second, in Core ML and in Vx, over N frames
@@ -28,7 +29,7 @@ import AppKit
 let args = CommandLine.arguments
 guard args.count >= 2 else {
   print(
-    "usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel] | --compare out.mov [N]]  |  vx-cam --camera"
+    "usage: vx-cam <clip.mov> [--headless N [dir] | --write out.mov [mask] [outline] [panel] [N] | --compare out.mov [N]]  |  vx-cam --camera"
   )
   exit(2)
 }
@@ -42,7 +43,10 @@ if args[1] == "--camera" {
     exit(0)
   }
   if args.count >= 4 && args[2] == "--write" {
-    runWrite(source: clip, to: args[3], options: Set(args.dropFirst(4)))
+    let rest = args.dropFirst(4)
+    runWrite(
+      source: clip, to: args[3], options: Set(rest.filter { Int($0) == nil }),
+      frames: rest.compactMap { Int($0) }.first)
     exit(0)
   }
   if args.count >= 4 && args[2] == "--compare" {
